@@ -7,8 +7,8 @@
 </p>
 
 <p align="center">
-  <a href="https://dockhand.io">Website</a> •
-  <a href="https://dockhand.io/docs">Documentation</a> •
+  <a href="https://dockhand.pro">Website</a> •
+  <a href="https://dockhand.pro/manual">Documentation</a> •
   <a href="#license">License</a>
 </p>
 
