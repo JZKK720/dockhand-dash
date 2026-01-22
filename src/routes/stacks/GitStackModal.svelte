@@ -264,6 +264,16 @@
 	}
 
 	function resetForm() {
+		// Clear state BEFORE async loads to avoid race conditions
+		formError = '';
+		errors = {};
+		copiedWebhookUrl = false;
+		copiedWebhookSecret = false;
+		envFiles = [];
+		envVars = [];
+		fileEnvVars = {};
+		existingSecretKeys = new Set();
+
 		if (gitStack) {
 			formRepoMode = 'existing';
 			formRepositoryId = gitStack.repositoryId;
@@ -275,7 +285,7 @@
 			formWebhookEnabled = gitStack.webhookEnabled;
 			formWebhookSecret = gitStack.webhookSecret || '';
 			formDeployNow = false;
-			// Load env files and overrides for editing
+			// Load env files and overrides for editing (async - will populate envFiles, envVars, fileEnvVars)
 			loadEnvFiles();
 			loadEnvVarsOverrides();
 			if (gitStack.envFilePath) {
@@ -298,14 +308,6 @@
 			formWebhookSecret = '';
 			formDeployNow = false;
 		}
-		formError = '';
-		errors = {};
-		copiedWebhookUrl = false;
-		copiedWebhookSecret = false;
-		envFiles = [];
-		envVars = [];
-		fileEnvVars = {};
-		existingSecretKeys = new Set();
 	}
 
 	async function saveGitStack(deployAfterSave: boolean = false) {
@@ -392,30 +394,29 @@
 				return;
 			}
 
-			// Save environment variable overrides if we have any
+			// Save environment variable overrides (always save to ensure DB is in sync)
+			// This handles both adding new vars and clearing all vars
 			const definedVars = envVars.filter(v => v.key.trim());
-			if (definedVars.length > 0) {
-				try {
-					const envResponse = await fetch(
-						`/api/stacks/${encodeURIComponent(formStackName)}/env${environmentId ? `?env=${environmentId}` : ''}`,
-						{
-							method: 'PUT',
-							headers: { 'Content-Type': 'application/json' },
-							body: JSON.stringify({
-								variables: definedVars.map(v => ({
-									key: v.key.trim(),
-									value: v.value,
-									isSecret: v.isSecret
-								}))
-							})
-						}
-					);
-					if (!envResponse.ok) {
-						console.error('Failed to save environment variables');
+			try {
+				const envResponse = await fetch(
+					`/api/stacks/${encodeURIComponent(formStackName)}/env${environmentId ? `?env=${environmentId}` : ''}`,
+					{
+						method: 'PUT',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({
+							variables: definedVars.map(v => ({
+								key: v.key.trim(),
+								value: v.value,
+								isSecret: v.isSecret
+							}))
+						})
 					}
-				} catch (e) {
-					console.error('Failed to save environment variables:', e);
+				);
+				if (!envResponse.ok) {
+					console.error('Failed to save environment variables');
 				}
+			} catch (e) {
+				console.error('Failed to save environment variables:', e);
 			}
 
 			onSaved();

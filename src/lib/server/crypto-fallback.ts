@@ -10,6 +10,7 @@
 
 import { existsSync, openSync, readSync, closeSync } from 'node:fs';
 import os from 'node:os';
+import { randomBytes } from 'node:crypto';
 
 // Cache kernel version check result
 let needsFallback: boolean | null = null;
@@ -140,7 +141,6 @@ export function secureRandomBytes(size: number): Buffer {
 	}
 
 	// Use native crypto on modern kernels
-	const { randomBytes } = require('node:crypto');
 	return randomBytes(size);
 }
 

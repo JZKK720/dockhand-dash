@@ -1,5 +1,22 @@
 [
   {
+    "version": "1.0.12",
+    "date": "2026-01-22",
+    "changes": [
+      { "type": "feature", "text": "Add SKIP_DF_COLLECTION env var to disable slow disk usage collection on NAS devices" },
+      { "type": "fix", "text": "Fix terminal/shell connections to direct TLS/mTLS and Hawser Standard environments" },
+      { "type": "fix", "text": "Fix crash when Hawser agent is stopped from Dockhand" },
+      { "type": "fix", "text": "Skip auto-update for SHA-pinned images (image@sha256:...)" },
+      { "type": "fix", "text": "Fix pending updates not cleared when containers or stacks are deleted" },
+      { "type": "fix", "text": "Fix adopted stacks using wrong .env path from internal directory instead of original location" },
+      { "type": "fix", "text": "Improve /login audit logs information" },
+      { "type": "fix", "text": "Fix login/logout screen refresh issue" },
+      { "type": "fix", "text": "Fix password change not persisting" },
+      { "type": "fix", "text": "Fix audit log page showing empty values" }
+    ],
+    "imageTag": "fnsys/dockhand:v1.0.12"
+  },
+  {
     "version": "1.0.11",
     "date": "2026-01-20",
     "changes": [

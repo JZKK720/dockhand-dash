@@ -21,6 +21,9 @@ import { authorize } from '$lib/server/authorize';
 import type { EnvironmentStats } from '../+server';
 import { parseLabels } from '$lib/utils/label-colors';
 
+// Skip disk usage collection (Synology NAS performance fix)
+const SKIP_DF_COLLECTION = process.env.SKIP_DF_COLLECTION === 'true' || process.env.SKIP_DF_COLLECTION === '1';
+
 // Helper to add timeout to promises
 function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
 	return Promise.race([
@@ -31,6 +34,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T
 
 // Disk usage cache - getDiskUsage() is very slow (30s timeout) but data changes rarely
 // Cache per environment with 5-minute TTL
+// DISABLED when SKIP_DF_COLLECTION is set (kills Synology NAS devices)
 interface DiskUsageCache {
 	data: any;
 	timestamp: number;
@@ -344,37 +348,49 @@ async function getEnvironmentStatsProgressive(
 			});
 
 		// PHASE 3: Disk usage (slow - includes volumes) - uses cache for better performance
-		const diskUsagePromise = getCachedDiskUsage(env.id)
-			.then((diskUsage) => {
-				if (diskUsage) {
-					// Update images with disk usage data (more accurate)
-					envStats.images.total = diskUsage.Images?.length || envStats.images.total;
-					envStats.images.totalSize = diskUsage.Images?.reduce((sum: number, img: any) => sum + getValidSize(img.Size), 0) || envStats.images.totalSize;
-
-					// Volumes from disk usage
-					envStats.volumes.total = diskUsage.Volumes?.length || 0;
-					envStats.volumes.totalSize = diskUsage.Volumes?.reduce((sum: number, vol: any) => sum + getValidSize(vol.UsageData?.Size), 0) || 0;
-
-					// Containers disk size
-					envStats.containersSize = diskUsage.Containers?.reduce((sum: number, c: any) => sum + getValidSize(c.SizeRw), 0) || 0;
-
-					// Build cache
-					envStats.buildCacheSize = diskUsage.BuildCache?.reduce((sum: number, bc: any) => sum + getValidSize(bc.Size), 0) || 0;
-				}
+		// Can be disabled with SKIP_DF_COLLECTION env var for Synology NAS
+		const diskUsagePromise = SKIP_DF_COLLECTION
+			? Promise.resolve(null).then(() => {
 				envStats.loading!.volumes = false;
 				envStats.loading!.diskUsage = false;
-
 				onPartialUpdate({
 					id: env.id,
-					images: { ...envStats.images },
 					volumes: { ...envStats.volumes },
-					containersSize: envStats.containersSize,
-					buildCacheSize: envStats.buildCacheSize,
 					loading: { ...envStats.loading! }
 				});
+				return null;
+			})
+			: getCachedDiskUsage(env.id)
+				.then((diskUsage) => {
+					if (diskUsage) {
+						// Update images with disk usage data (more accurate)
+						envStats.images.total = diskUsage.Images?.length || envStats.images.total;
+						envStats.images.totalSize = diskUsage.Images?.reduce((sum: number, img: any) => sum + getValidSize(img.Size), 0) || envStats.images.totalSize;
 
-				return diskUsage;
-			});
+						// Volumes from disk usage
+						envStats.volumes.total = diskUsage.Volumes?.length || 0;
+						envStats.volumes.totalSize = diskUsage.Volumes?.reduce((sum: number, vol: any) => sum + getValidSize(vol.UsageData?.Size), 0) || 0;
+
+						// Containers disk size
+						envStats.containersSize = diskUsage.Containers?.reduce((sum: number, c: any) => sum + getValidSize(c.SizeRw), 0) || 0;
+
+						// Build cache
+						envStats.buildCacheSize = diskUsage.BuildCache?.reduce((sum: number, bc: any) => sum + getValidSize(bc.Size), 0) || 0;
+					}
+					envStats.loading!.volumes = false;
+					envStats.loading!.diskUsage = false;
+
+					onPartialUpdate({
+						id: env.id,
+						images: { ...envStats.images },
+						volumes: { ...envStats.volumes },
+						containersSize: envStats.containersSize,
+						buildCacheSize: envStats.buildCacheSize,
+						loading: { ...envStats.loading! }
+					});
+
+					return diskUsage;
+				});
 
 		// PHASE 4: Top containers (slow - requires per-container stats)
 		// Limited to TOP_CONTAINERS_LIMIT containers to reduce API calls

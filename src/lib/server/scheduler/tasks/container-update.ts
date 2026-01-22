@@ -124,6 +124,18 @@ export async function runContainerUpdate(
 			return;
 		}
 
+		// Skip digest-pinned images - they are explicitly locked to a specific version
+		if (isDigestBasedImage(imageNameFromConfig)) {
+			log(`Skipping ${containerName} - image pinned to specific digest`);
+			await updateScheduleExecution(execution.id, {
+				status: 'skipped',
+				completedAt: new Date().toISOString(),
+				duration: Date.now() - startTime,
+				details: { reason: 'Image pinned to specific digest' }
+			});
+			return;
+		}
+
 		// Get the actual image ID from inspect data
 		const currentImageId = inspectData.Image;
 

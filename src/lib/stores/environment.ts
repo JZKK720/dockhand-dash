@@ -161,7 +161,18 @@ function createEnvironmentsStore() {
 		refresh: fetchEnvironments,
 		set,
 		update,
-		loaded // Expose the loaded store for consumers to know when first fetch is complete
+		loaded, // Expose the loaded store for consumers to know when first fetch is complete
+		/**
+		 * Clear all environment data (used on logout)
+		 */
+		clear: () => {
+			set([]);
+			loaded.set(false);
+			if (browser) {
+				localStorage.removeItem(STORAGE_KEY);
+			}
+			currentEnvironment.set(null);
+		}
 	};
 }
 

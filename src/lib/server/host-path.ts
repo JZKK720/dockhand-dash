@@ -2,19 +2,21 @@
  * Host Path Resolution Module
  *
  * Dockhand runs inside a Docker container where paths differ from the host.
- * This module detects the host path for the DATA_DIR mount, enabling proper
- * volume path resolution for compose stacks.
+ * This module detects the host paths for ALL container mounts, enabling proper
+ * volume path resolution for compose stacks (both internal and adopted/external).
  *
  * Problem:
  * - Dockhand container has /app/data mounted from host (e.g., -v dockhand_data:/app/data)
+ * - User may also mount external directories (e.g., -v /host/stacks:/external-stacks)
  * - Compose file says: ./ca.pem:/ca.pem (relative path)
- * - docker-compose resolves this to /app/data/stacks/.../ca.pem
- * - Docker daemon on HOST receives this path, but /app/data doesn't exist on host!
+ * - docker-compose resolves this to container path (e.g., /external-stacks/.../ca.pem)
+ * - Docker daemon on HOST receives this path, but /external-stacks doesn't exist on host!
  * - Docker creates a directory instead of mounting the file
  *
  * Solution:
- * - Query Docker API to find the host source path for our /app/data mount
- * - Rewrite relative paths in compose files to use the host path
+ * - Query Docker API to find ALL host source paths for our container mounts
+ * - Rewrite relative paths in compose files to use the correct host path
+ * - Works for both internal stacks (DATA_DIR) and adopted stacks (external mounts)
  */
 
 import { readFileSync } from 'node:fs';
@@ -23,6 +25,9 @@ import { resolve } from 'node:path';
 // Cache the host data dir to avoid repeated API calls
 let cachedHostDataDir: string | null = null;
 let detectionAttempted = false;
+
+// Cache ALL mounts for path translation (not just DATA_DIR)
+let cachedMounts: Array<{ source: string; destination: string }> | null = null;
 
 /**
  * Get our own container ID
@@ -111,6 +116,13 @@ export async function detectHostDataDir(): Promise<string | null> {
 			}>;
 		};
 
+		// Cache ALL mounts for later path translation (used by rewriteComposeVolumePaths)
+		cachedMounts = (containerInfo.Mounts || []).map(m => ({
+			source: m.Source,
+			destination: m.Destination
+		}));
+		console.log(`[HostPath] Cached ${cachedMounts.length} mount(s)`);
+
 		// Find the mount for our DATA_DIR
 		const dataMount = containerInfo.Mounts?.find(m => m.Destination === dataDir);
 
@@ -169,6 +181,34 @@ export function translateToHostPath(containerPath: string): string {
 }
 
 /**
+ * Translate any container path to host path using ALL cached mounts.
+ * This is more general than translateToHostPath() which only handles DATA_DIR.
+ *
+ * @param containerPath - Path inside the container (e.g., /external-stacks/mystack)
+ * @returns Host path if a matching mount is found, or null if no translation possible
+ */
+export function translateContainerPathViaMount(containerPath: string): string | null {
+	if (!cachedMounts || cachedMounts.length === 0) {
+		return null;
+	}
+
+	// Sort mounts by destination length (longest first) to match most specific mount
+	const sortedMounts = [...cachedMounts].sort(
+		(a, b) => b.destination.length - a.destination.length
+	);
+
+	for (const mount of sortedMounts) {
+		if (containerPath.startsWith(mount.destination + '/') ||
+			containerPath === mount.destination) {
+			const relativePath = containerPath.substring(mount.destination.length);
+			return mount.source + relativePath;
+		}
+	}
+
+	return null;
+}
+
+/**
  * Rewrite relative volume paths in a compose file to use absolute host paths.
  * This is necessary when Dockhand runs inside Docker with a mounted data volume.
  *
@@ -180,23 +220,16 @@ export function translateToHostPath(containerPath: string): string {
  * @returns Modified compose content with absolute host paths, or original if no translation needed
  */
 export function rewriteComposeVolumePaths(composeContent: string, workingDir: string): { content: string; modified: boolean; changes: string[] } {
-	const hostDataDir = getHostDataDir();
 	const changes: string[] = [];
 
-	if (!hostDataDir) {
+	// Try to translate workingDir to host path using ANY cached mount
+	// This handles both DATA_DIR mounts and external mounts (e.g., /external-stacks)
+	const hostWorkingDir = translateContainerPathViaMount(workingDir);
+
+	if (!hostWorkingDir) {
+		// Can't translate - workingDir is not under any known mount
 		return { content: composeContent, modified: false, changes };
 	}
-
-	const dataDir = resolve(process.env.DATA_DIR || '/app/data');
-
-	// Check if workingDir is under DATA_DIR
-	if (!workingDir.startsWith(dataDir + '/') && workingDir !== dataDir) {
-		return { content: composeContent, modified: false, changes };
-	}
-
-	// Calculate the host working directory
-	const relativePath = workingDir.substring(dataDir.length);
-	const hostWorkingDir = hostDataDir + relativePath;
 
 	// Parse compose content line by line to find and rewrite volume mounts
 	// We look for patterns like:

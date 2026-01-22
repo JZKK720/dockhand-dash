@@ -1877,6 +1877,15 @@ export async function checkImageUpdateAvailable(
 	envId?: number
 ): Promise<ImageUpdateCheckResult> {
 	try {
+		// Skip update check for digest-pinned images
+		// If the user explicitly pins to a digest (image@sha256:...), they don't want auto-updates
+		if (isDigestBasedImage(imageName)) {
+			return {
+				hasUpdate: false,
+				currentDigest: imageName.split('@')[1] // Extract the digest part
+			};
+		}
+
 		// Get current image info to get RepoDigests
 		let currentImageInfo: any;
 		try {

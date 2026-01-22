@@ -20,8 +20,12 @@ import {
 	getGitStackByName,
 	deleteGitStack,
 	getStackSources,
-	deleteStackEnvVars
+	deleteStackEnvVars,
+	removePendingContainerUpdate,
+	deleteAutoUpdateSchedule,
+	getAutoUpdateSetting
 } from './db';
+import { unregisterSchedule } from './scheduler';
 import { deleteGitStackFiles } from './git';
 import { cleanPem } from '$lib/utils/pem';
 import { rewriteComposeVolumePaths, getHostDataDir } from './host-path';
@@ -1534,18 +1538,24 @@ async function requireComposeFile(
 	const dbNonSecretVars = await getNonSecretEnvVarsAsRecord(stackName, envId);
 
 	// Read non-secret vars from .env file
-	// For stacks with custom path, use the env path if set (and not empty string which means "no env file")
-	// Otherwise, use the .env file in the stack directory
+	// For stacks with custom composePath (adopted/external), derive envPath from same directory
+	// For internal stacks, use the default data directory
 	let envFilePath: string | null = null;
 
-	if (composeResult.composePath && composeResult.envPath) {
-		// Custom compose path with explicit env path
-		envFilePath = composeResult.envPath;
-	} else if (composeResult.composePath && composeResult.envPath === '') {
-		// Custom compose path with explicit "no env file" - don't read any file
-		envFilePath = null;
+	if (composeResult.composePath) {
+		// Adopted/external stack with custom compose path
+		if (composeResult.envPath) {
+			// Explicit env path stored in database
+			envFilePath = composeResult.envPath;
+		} else if (composeResult.envPath === '') {
+			// Explicitly no env file (user selected "no .env")
+			envFilePath = null;
+		} else {
+			// envPath is null - look for .env next to the compose file
+			envFilePath = join(dirname(composeResult.composePath), '.env');
+		}
 	} else {
-		// Default location - look for .env in stack directory
+		// Internal stack - use default data directory location
 		const stackDir = composeResult.stackDir || await findStackDir(stackName, envId) || await getStackDir(stackName, envId);
 		envFilePath = join(stackDir, '.env');
 	}
@@ -1699,6 +1709,9 @@ export async function removeStack(
 		// Get compose file (may not exist for external stacks)
 		const composeResult = await getStackComposeFile(stackName);
 
+		// Get stack containers BEFORE removing them (for cleanup later)
+		const stackContainers = await getStackContainers(stackName, envId);
+
 		// If compose file exists, run docker compose down first
 		if (composeResult.success) {
 			const envVars = await getNonSecretEnvVarsAsRecord(stackName, envId);
@@ -1722,7 +1735,6 @@ export async function removeStack(
 		} else {
 			// External stack - remove containers directly in parallel
 			const { removeContainer } = await import('./docker.js');
-			const stackContainers = await getStackContainers(stackName, envId);
 
 			const removalResults = await Promise.allSettled(
 				stackContainers.map((container) =>
@@ -1746,12 +1758,70 @@ export async function removeStack(
 			}
 		}
 
+		// Clean up auto-update schedules and pending updates for stack containers
+		const envIdNum = typeof envId === 'number' ? envId : undefined;
+		for (const container of stackContainers) {
+			const containerName = container.names?.[0]?.replace(/^\//, '') || container.name;
+			const containerId = container.id;
+
+			// Clean up auto-update schedule
+			try {
+				const setting = await getAutoUpdateSetting(containerName, envIdNum);
+				if (setting) {
+					unregisterSchedule(setting.id, 'container_update');
+					await deleteAutoUpdateSchedule(containerName, envIdNum);
+				}
+			} catch {
+				// Ignore cleanup errors
+			}
+
+			// Clean up pending container update
+			try {
+				if (envIdNum) {
+					await removePendingContainerUpdate(envIdNum, containerId);
+				}
+			} catch {
+				// Ignore cleanup errors
+			}
+		}
+
 		// Clean up database records - collect errors but don't stop
 		const cleanupErrors: string[] = [];
 
 		// Delete compose file and directory
-		const stackDir = await findStackDir(stackName, envId) || await getStackDir(stackName, envId);
-		if (existsSync(stackDir)) {
+		// Only delete files that are within Dockhand's data directory (stacks we created)
+		// Adopted/imported stacks have files outside DATA_DIR and should be preserved
+		const stackSource = await getStackSource(stackName, envId);
+		const stacksDir = getStacksDir();
+
+		// Determine what directory to delete (if any)
+		let stackDir: string | null = null;
+
+		if (stackSource?.composePath) {
+			// Check if the compose path is within Dockhand's stacks directory
+			const customDir = dirname(stackSource.composePath);
+			const resolvedCustomDir = resolve(customDir);
+			const resolvedStacksDir = resolve(stacksDir);
+
+			// Only delete if the directory is within DATA_DIR/stacks/ (files we created)
+			// AND it looks like a stack directory (contains stackName for safety)
+			if (resolvedCustomDir.startsWith(resolvedStacksDir) &&
+				customDir.includes(stackName) &&
+				existsSync(customDir)) {
+				stackDir = customDir;
+			}
+		}
+
+		// Fall back to default paths (always within DATA_DIR/stacks/)
+		if (!stackDir) {
+			const defaultDir = await findStackDir(stackName, envId) || await getStackDir(stackName, envId);
+			if (existsSync(defaultDir)) {
+				stackDir = defaultDir;
+			}
+		}
+
+		// Delete the directory if found
+		if (stackDir) {
 			try {
 				rmSync(stackDir, { recursive: true, force: true });
 			} catch (err: any) {
