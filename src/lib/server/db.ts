@@ -3023,13 +3023,32 @@ export async function logAuditEvent(data: AuditLogCreateData): Promise<AuditLogD
 	return auditLog!;
 }
 
-export async function getAuditLog(id: number): Promise<AuditLogData | undefined> {
-	const results = await db.select().from(auditLogs).where(eq(auditLogs.id, id));
+export async function getAuditLog(id: number): Promise<(AuditLogData & { environmentName?: string | null; environmentIcon?: string | null }) | undefined> {
+	const results = await db.select({
+		id: auditLogs.id,
+		userId: auditLogs.userId,
+		username: auditLogs.username,
+		action: auditLogs.action,
+		entityType: auditLogs.entityType,
+		entityId: auditLogs.entityId,
+		entityName: auditLogs.entityName,
+		environmentId: auditLogs.environmentId,
+		description: auditLogs.description,
+		details: auditLogs.details,
+		ipAddress: auditLogs.ipAddress,
+		userAgent: auditLogs.userAgent,
+		createdAt: auditLogs.createdAt,
+		environmentName: environments.name,
+		environmentIcon: environments.icon
+	})
+		.from(auditLogs)
+		.leftJoin(environments, eq(auditLogs.environmentId, environments.id))
+		.where(eq(auditLogs.id, id));
 	if (!results[0]) return undefined;
 	return {
 		...results[0],
 		details: results[0].details ? JSON.parse(results[0].details) : null
-	} as AuditLogData;
+	} as AuditLogData & { environmentName?: string | null; environmentIcon?: string | null };
 }
 
 export async function getAuditLogs(filters: AuditLogFilters = {}): Promise<AuditLogResult> {
@@ -4428,6 +4447,39 @@ export async function deleteStackEnvVars(
 		await db.delete(stackEnvironmentVariables)
 			.where(and(
 				eq(stackEnvironmentVariables.stackName, stackName),
+				eq(stackEnvironmentVariables.environmentId, environmentId)
+			));
+	}
+}
+
+/**
+ * Update stack name in environment variables (for stack rename operations).
+ * @param oldStackName - Current stack name
+ * @param newStackName - New stack name
+ * @param environmentId - Optional environment ID (null = no environment, undefined = all environments)
+ */
+export async function updateStackEnvVarsName(
+	oldStackName: string,
+	newStackName: string,
+	environmentId?: number | null
+): Promise<void> {
+	if (environmentId === undefined) {
+		// Update all env vars for this stack (all environments)
+		await db.update(stackEnvironmentVariables)
+			.set({ stackName: newStackName })
+			.where(eq(stackEnvironmentVariables.stackName, oldStackName));
+	} else if (environmentId === null) {
+		await db.update(stackEnvironmentVariables)
+			.set({ stackName: newStackName })
+			.where(and(
+				eq(stackEnvironmentVariables.stackName, oldStackName),
+				isNull(stackEnvironmentVariables.environmentId)
+			));
+	} else {
+		await db.update(stackEnvironmentVariables)
+			.set({ stackName: newStackName })
+			.where(and(
+				eq(stackEnvironmentVariables.stackName, oldStackName),
 				eq(stackEnvironmentVariables.environmentId, environmentId)
 			));
 	}

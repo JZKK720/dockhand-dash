@@ -68,20 +68,20 @@
 
 	interface AuditLogEntry {
 		id: number;
-		user_id: number | null;
+		userId: number | null;
 		username: string;
 		action: string;
-		entity_type: string;
-		entity_id: string | null;
-		entity_name: string | null;
-		environment_id: number | null;
-		environment_name: string | null;
-		environment_icon: string | null;
+		entityType: string;
+		entityId: string | null;
+		entityName: string | null;
+		environmentId: number | null;
+		environmentName: string | null;
+		environmentIcon: string | null;
 		description: string | null;
 		details: any | null;
-		ip_address: string | null;
-		user_agent: string | null;
-		timestamp: string;
+		ipAddress: string | null;
+		userAgent: string | null;
+		createdAt: string;
 	}
 
 	interface Environment {
@@ -555,16 +555,16 @@
 	function handleNewAuditEvent(event: SSEAuditLogEntry) {
 		// Check if event matches current filters
 		if (filterUsernames.length > 0 && !filterUsernames.includes(event.username)) return;
-		if (filterEntityTypes.length > 0 && !filterEntityTypes.includes(event.entity_type)) return;
+		if (filterEntityTypes.length > 0 && !filterEntityTypes.includes(event.entityType)) return;
 		if (filterActions.length > 0 && !filterActions.includes(event.action)) return;
 
 		// Check date filters
 		if (filterFromDate) {
-			const eventDate = new Date(event.timestamp).toISOString().split('T')[0];
+			const eventDate = new Date(event.createdAt).toISOString().split('T')[0];
 			if (eventDate < filterFromDate) return;
 		}
 		if (filterToDate) {
-			const eventDate = new Date(event.timestamp).toISOString().split('T')[0];
+			const eventDate = new Date(event.createdAt).toISOString().split('T')[0];
 			if (eventDate > filterToDate) return;
 		}
 
@@ -981,14 +981,14 @@
 										onkeydown={(e) => e.key === 'Enter' && showDetails(log)}
 									>
 										<div class="px-2 font-mono whitespace-nowrap">
-											{formatTimestamp(log.timestamp)}
+											{formatTimestamp(log.createdAt)}
 										</div>
 										<div class="px-2">
-											{#if log.environment_name}
-												{@const LogEnvIcon = getIconComponent(log.environment_icon || 'globe')}
+											{#if log.environmentName}
+												{@const LogEnvIcon = getIconComponent(log.environmentIcon || 'globe')}
 												<div class="flex items-center gap-1 truncate">
 													<LogEnvIcon class="w-3 h-3 text-muted-foreground shrink-0" />
-													<span class="truncate">{log.environment_name}</span>
+													<span class="truncate">{log.environmentName}</span>
 												</div>
 											{:else}
 												<span class="text-muted-foreground">-</span>
@@ -1007,17 +1007,17 @@
 										</div>
 										<div class="px-2">
 											<div class="flex items-center gap-1 truncate">
-												<svelte:component this={getEntityIcon(log.entity_type)} class="w-3 h-3 text-muted-foreground shrink-0" />
-												<span class="truncate">{log.entity_type}</span>
+												<svelte:component this={getEntityIcon(log.entityType)} class="w-3 h-3 text-muted-foreground shrink-0" />
+												<span class="truncate">{log.entityType}</span>
 											</div>
 										</div>
 										<div class="px-2">
-											<span class="truncate" title={log.entity_name || log.entity_id || '-'}>
-												{log.entity_name || log.entity_id || '-'}
+											<span class="truncate" title={log.entityName || log.entityId || '-'}>
+												{log.entityName || log.entityId || '-'}
 											</span>
 										</div>
 										<div class="px-2 font-mono text-muted-foreground">
-											{log.ip_address || '-'}
+											{log.ipAddress || '-'}
 										</div>
 										<div class="px-2 flex items-center justify-center">
 											<Button variant="ghost" size="sm" onclick={(e) => { e.stopPropagation(); showDetails(log); }}>
@@ -1060,7 +1060,7 @@
 				<div class="grid grid-cols-2 gap-4">
 					<div>
 						<label class="text-sm font-medium text-muted-foreground">Timestamp</label>
-						<p class="font-mono text-sm">{formatTimestamp(selectedLog.timestamp)}</p>
+						<p class="font-mono text-sm">{formatTimestamp(selectedLog.createdAt)}</p>
 					</div>
 					<div>
 						<label class="text-sm font-medium text-muted-foreground">User</label>
@@ -1081,32 +1081,32 @@
 					<div>
 						<label class="text-sm font-medium text-muted-foreground">Entity type</label>
 						<p class="flex items-center gap-1">
-							<svelte:component this={getEntityIcon(selectedLog.entity_type)} class="w-4 h-4 text-muted-foreground" />
-							{selectedLog.entity_type}
+							<svelte:component this={getEntityIcon(selectedLog.entityType)} class="w-4 h-4 text-muted-foreground" />
+							{selectedLog.entityType}
 						</p>
 					</div>
-					{#if selectedLog.entity_name}
+					{#if selectedLog.entityName}
 						<div>
 							<label class="text-sm font-medium text-muted-foreground">Entity name</label>
-							<p>{selectedLog.entity_name}</p>
+							<p>{selectedLog.entityName}</p>
 						</div>
 					{/if}
-					{#if selectedLog.entity_id}
+					{#if selectedLog.entityId}
 						<div>
 							<label class="text-sm font-medium text-muted-foreground">Entity ID</label>
-							<p class="font-mono text-sm break-all">{selectedLog.entity_id}</p>
+							<p class="font-mono text-sm break-all">{selectedLog.entityId}</p>
 						</div>
 					{/if}
-					{#if selectedLog.environment_id}
+					{#if selectedLog.environmentId}
 						<div>
 							<label class="text-sm font-medium text-muted-foreground">Environment ID</label>
-							<p>{selectedLog.environment_id}</p>
+							<p>{selectedLog.environmentId}</p>
 						</div>
 					{/if}
-					{#if selectedLog.ip_address}
+					{#if selectedLog.ipAddress}
 						<div>
 							<label class="text-sm font-medium text-muted-foreground">IP address</label>
-							<p class="font-mono text-sm">{selectedLog.ip_address}</p>
+							<p class="font-mono text-sm">{selectedLog.ipAddress}</p>
 						</div>
 					{/if}
 				</div>
@@ -1118,10 +1118,10 @@
 					</div>
 				{/if}
 
-				{#if selectedLog.user_agent}
+				{#if selectedLog.userAgent}
 					<div>
 						<label class="text-sm font-medium text-muted-foreground">User agent</label>
-						<p class="text-xs text-muted-foreground break-all">{selectedLog.user_agent}</p>
+						<p class="text-xs text-muted-foreground break-all">{selectedLog.userAgent}</p>
 					</div>
 				{/if}
 

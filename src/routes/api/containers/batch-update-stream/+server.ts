@@ -182,6 +182,22 @@ export const POST: RequestHandler = async (event) => {
 						continue;
 					}
 
+					// Skip digest-pinned images - they are explicitly locked to a specific version
+					if (isDigestBasedImage(imageName)) {
+						safeEnqueue({
+							type: 'progress',
+							containerId,
+							containerName,
+							step: 'skipped',
+							current: i + 1,
+							total: containerIds.length,
+							success: true,
+							message: `Skipping ${containerName} - image pinned to specific digest`
+						});
+						skippedCount++;
+						continue;
+					}
+
 					// Step 1: Pull latest image
 					safeEnqueue({
 						type: 'progress',
@@ -559,8 +575,18 @@ export const POST: RequestHandler = async (event) => {
 					: `Updated ${successCount} of ${containerIds.length} containers`
 			});
 
-			clearInterval(keepaliveInterval);
-			controller.close();
+			if (keepaliveInterval) {
+				clearInterval(keepaliveInterval);
+			}
+			if (!controllerClosed) {
+				try {
+					controller.close();
+					controllerClosed = true;
+				} catch {
+					// Controller already closed - ignore
+					controllerClosed = true;
+				}
+			}
 		},
 		cancel() {
 			controllerClosed = true;

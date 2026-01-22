@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { getGitStack, updateGitStack, deleteGitStack, deleteStackSource, updateStackSourceName } from '$lib/server/db';
+import { getGitStack, updateGitStack, deleteGitStack, deleteStackSource, updateStackSourceName, updateStackEnvVarsName } from '$lib/server/db';
 import { deleteGitStackFiles, deployGitStack } from '$lib/server/git';
 import { authorize } from '$lib/server/authorize';
 import { registerSchedule, unregisterSchedule } from '$lib/server/scheduler';
@@ -71,9 +71,10 @@ export const PUT: RequestHandler = async ({ params, request, cookies }) => {
 			webhookSecret: data.webhookSecret
 		});
 
-		// If stack name changed, update the stack_sources record too
+		// If stack name changed, update related records
 		if (data.stackName && data.stackName !== oldStackName) {
 			await updateStackSourceName(oldStackName, data.stackName, existing.environmentId);
+			await updateStackEnvVarsName(oldStackName, data.stackName, existing.environmentId);
 		}
 
 		// Register or unregister schedule with croner

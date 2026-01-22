@@ -384,11 +384,11 @@ export async function syncRepository(repoId: number): Promise<SyncResult> {
 		let currentCommit = '';
 
 		if (!existsSync(repoPath)) {
-			// Clone the repository (shallow clone)
+			// Clone the repository (blobless clone - fetches all commits but blobs on-demand)
 			const repoUrl = buildRepoUrl(repo.url, credential);
 
 			const result = await execGit(
-				['clone', '--depth=1', '--branch', repo.branch, repoUrl, repoPath],
+				['clone', '--filter=blob:none', '--branch', repo.branch, repoUrl, repoPath],
 				process.cwd(),
 				env
 			);
@@ -611,7 +611,7 @@ export async function syncGitStack(stackId: number): Promise<SyncResult> {
 		let currentCommit = '';
 
 		// Always re-clone to ensure clean state (handles branch/URL/credential changes, force pushes, etc.)
-		// Shallow clones are fast so this is acceptable
+		// Blobless clones fetch all commits (for git diff) but download blobs on-demand
 		const previousCommit = await getPreviousCommit(repoPath, env);
 		if (existsSync(repoPath)) {
 			console.log(`${logPrefix} Removing existing clone for fresh sync...`);
@@ -622,7 +622,7 @@ export async function syncGitStack(stackId: number): Promise<SyncResult> {
 		const repoUrl = buildRepoUrl(repo.url, credential);
 
 		const result = await execGit(
-			['clone', '--depth=1', '--branch', repo.branch, repoUrl, repoPath],
+			['clone', '--filter=blob:none', '--branch', repo.branch, repoUrl, repoPath],
 			process.cwd(),
 			env
 		);
@@ -993,10 +993,10 @@ export async function deployGitStackWithProgress(
 
 		const repoUrl = buildRepoUrl(repo.url, credential);
 
-		// Step 3: Fetching
+		// Step 3: Fetching (blobless clone - fetches all commits but blobs on-demand)
 		onProgress({ status: 'fetching', message: `Fetching branch ${repo.branch}...`, step: 3, totalSteps });
 		const cloneResult = await execGit(
-			['clone', '--depth=1', '--branch', repo.branch, repoUrl, repoPath],
+			['clone', '--filter=blob:none', '--branch', repo.branch, repoUrl, repoPath],
 			process.cwd(),
 			env
 		);
