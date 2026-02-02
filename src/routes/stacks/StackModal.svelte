@@ -84,6 +84,10 @@
 	// Path source info (for hint display)
 	let pathSource = $state<'default' | 'custom' | 'browsed' | null>(null);
 
+	// Base directory when user browsed to a directory (without stack name yet)
+	let browsedBaseDirectory = $state<string | null>(null);
+
+
 	// UI state
 	let composePathCopied = $state(false);
 	let envPathCopied = $state(false);
@@ -112,12 +116,16 @@
 
 	// Derived: source hint text for the path bar (only in create mode)
 	const pathSourceHint = $derived.by(() => {
-		if (mode !== 'create' || !workingComposePath) return undefined;
+		if (mode !== 'create') return undefined;
+		// Show hint when user selected a directory but hasn't entered stack name yet
+		if (browsedBaseDirectory && !workingComposePath) {
+			return `Will create in ${browsedBaseDirectory}/`;
+		}
+		if (!workingComposePath) return undefined;
 		switch (pathSource) {
 			case 'browsed':
-				return 'Custom location';
 			case 'custom':
-				return 'Using saved location';
+				return 'Custom location';
 			case 'default':
 				return 'Using default location';
 			default:
@@ -372,25 +380,56 @@
 
 		if (isDirectory) {
 			const stackName = newStackName.trim();
+			// Store the base directory so effect can rebuild path if user changes stack name
+			browsedBaseDirectory = baseDir;
 			if (stackName) {
-				// If we have a stack name, include the subfolder
+				// If we have a stack name, build the full path with subfolder
 				finalPath = `${baseDir}/${stackName}/compose.yaml`;
 			} else {
-				// No stack name yet - just show the selected directory
-				finalPath = `${baseDir}/`;
+				// No stack name yet - path will be completed when stack name is entered
+				finalPath = ''; // Don't set incomplete path
+				pathSource = 'browsed';
+				showFileBrowser = false;
+				isDirty = true;
+				return; // Exit early - path will be completed when stack name is entered
 			}
+		} else {
+			browsedBaseDirectory = null; // Selected a file, not a directory
 		}
 
+		// In CREATE mode, we only want the content - don't store external paths
+		// Files will be saved to the directory containing the selected compose file
+		if (mode === 'create') {
+			showFileBrowser = false;
+
+			// Load compose file content when selecting a file (not directory)
+			if (!isDirectory) {
+				// Build potential env path in same directory as compose file
+				const dir = finalPath.replace(/\/[^/]+$/, '');
+				const potentialEnvPath = `${dir}/.env`;
+				await loadFilesFromLocalFilesystem(finalPath, potentialEnvPath);
+				// Use the selected file's path directly
+				workingComposePath = finalPath;
+				workingEnvPath = `${dir}/.env`;
+				browsedBaseDirectory = null;
+				// 'custom' prevents the path effect from overriding (it only acts on 'browsed')
+				pathSource = 'custom';
+			} else {
+				pathSource = 'browsed';
+			}
+			isDirty = true;
+			return;
+		}
+
+		// EDIT mode - store the selected path
 		workingComposePath = finalPath;
 		pathSource = 'browsed';
 		showFileBrowser = false;
 
-		// Auto-suggest .env in the same directory (only if we have a full path)
-		if (!isDirectory || newStackName.trim()) {
-			const dir = finalPath.replace(/\/[^/]+$/, '');
-			if (!workingEnvPath) {
-				workingEnvPath = `${dir}/.env`;
-			}
+		// Auto-suggest .env in the same directory
+		const dir = finalPath.replace(/\/[^/]+$/, '');
+		if (!workingEnvPath) {
+			workingEnvPath = `${dir}/.env`;
 		}
 
 		// Load compose file content when selecting a file (not directory)
@@ -427,7 +466,6 @@
 			finalPath = path.endsWith('/') ? `${path}.env` : `${path}/.env`;
 		}
 
-		workingEnvPath = finalPath;
 		showFileBrowser = false;
 
 		// Load env content when selecting a file (not directory)
@@ -445,6 +483,15 @@
 				console.error('Failed to load env file:', e);
 			}
 		}
+
+		// Store the selected path:
+		// - Always in EDIT mode
+		// - In CREATE mode when user selected a custom compose location OR explicitly selected an env file
+		if (mode !== 'create' || pathSource === 'custom' || pathSource === 'browsed' || !isDirectory) {
+			workingEnvPath = finalPath;
+		}
+		// Otherwise CREATE mode with internal location uses default via suggestedEnvPath
+
 		isDirty = true;
 	}
 
@@ -456,7 +503,10 @@
 			if (composeResponse.ok) {
 				const composeData = await composeResponse.json();
 				composeContent = composeData.content || '';
-				workingComposePath = composeFilePath;
+				// Only set workingComposePath in EDIT mode - CREATE mode uses internal defaults
+				if (mode !== 'create') {
+					workingComposePath = composeFilePath;
+				}
 				// Clear the needsFileLocation flag since we now have content
 				needsFileLocation = false;
 				stackContainers = [];
@@ -465,18 +515,23 @@
 				console.error('Failed to load compose file:', err.error);
 			}
 
-			// Try to load .env file (only set workingEnvPath if it exists)
+			// Try to load .env file (only set workingEnvPath if it exists AND we're in edit mode)
 			if (envFilePath) {
 				const envResponse = await fetch(`/api/system/files/content?path=${encodeURIComponent(envFilePath)}`);
 				if (envResponse.ok) {
 					const envData = await envResponse.json();
 					rawEnvContent = envData.content || '';
-					workingEnvPath = envFilePath;
+					// Only set workingEnvPath in EDIT mode - CREATE mode uses internal defaults
+					if (mode !== 'create') {
+						workingEnvPath = envFilePath;
+					}
 					parseEnvVarsFromRaw(rawEnvContent);
 				} else {
 					// .env file not found - clear env path
 					rawEnvContent = '';
-					workingEnvPath = '';
+					if (mode !== 'create') {
+						workingEnvPath = '';
+					}
 				}
 			}
 		} catch (e) {
@@ -891,7 +946,7 @@ services:
 		}
 	}
 
-	async function handleSave(restart = false, moveFromDir: string | null = null) {
+	async function handleSave(restart = false, moveFromDir: string | null | undefined = undefined) {
 		errors = {};
 
 		// Validate compose content (unless file location is needed and we have a path)
@@ -909,7 +964,8 @@ services:
 		const envId = $currentEnvironment?.id ?? null;
 
 		// Check if directory has changed (edit mode only, and not already confirmed)
-		if (mode === 'edit' && !moveFromDir) {
+		// Use === undefined to distinguish "not checked yet" from "keep files" (empty string)
+		if (mode === 'edit' && moveFromDir === undefined) {
 			const newComposePath = workingComposePath.trim() || null;
 
 			// Only check if compose path changed (which means directory changed)
@@ -1012,32 +1068,32 @@ services:
 				throw new Error(rawEnvError.error || 'Failed to save environment file');
 			}
 
-			// Save ALL vars to DB (includes secrets with real values)
-			const definedVars = prepared.variables;
-			if (definedVars.length > 0 || hadExistingDbVars) {
+			// Save only secrets to DB (non-secrets are in the .env file written above)
+			const secretVars = prepared.variables.filter(v => v.isSecret);
+			if (secretVars.length > 0 || hadExistingDbVars) {
 				const envResponse = await fetch(
 					appendEnvParam(`/api/stacks/${encodeURIComponent(stackName)}/env`, envId),
 					{
 						method: 'PUT',
 						headers: { 'Content-Type': 'application/json' },
 						body: JSON.stringify({
-							variables: definedVars.map(v => ({
+							variables: secretVars.map(v => ({
 								key: v.key.trim(),
 								value: v.value,
-								isSecret: v.isSecret
+								isSecret: true
 							}))
 						})
 					}
 				);
 
 				if (!envResponse.ok) {
-					// Log but don't fail - DB stores secret metadata
-					console.warn('Failed to save environment variable metadata to database');
+					// Log but don't fail - DB stores secret values
+					console.warn('Failed to save secret variables to database');
 				}
 
-				hadExistingDbVars = definedVars.length > 0;
+				hadExistingDbVars = secretVars.length > 0;
 				existingSecretKeys = new Set(
-					definedVars.filter(v => v.isSecret && v.key.trim()).map(v => v.key.trim())
+					secretVars.filter(v => v.key.trim()).map(v => v.key.trim())
 				);
 			}
 
@@ -1070,7 +1126,7 @@ services:
 	// Handle path change - keep old files and proceed (just save without moving)
 	function confirmPathChangeKeepFiles() {
 		showPathChangeConfirm = false;
-		// Pass empty string to skip move check this time (not null, which means "not checked yet")
+		// Pass empty string to skip move check (undefined means "not checked yet")
 		handleSave(pendingSaveRestart, '');
 	}
 
@@ -1111,6 +1167,7 @@ services:
 		originalEnvPath = null;
 		autoComputedComposePath = '';
 		pathSource = null;
+		browsedBaseDirectory = null;
 		needsFileLocation = false;
 		stackContainers = [];
 		showFileBrowser = false;
@@ -1168,54 +1225,70 @@ services:
 		return () => clearTimeout(timeout);
 	});
 
+	// Pre-fetched default base directory for create mode (fetched once on open/env change)
+	let defaultStackDir = $state<string | null>(null);
+
+	async function fetchDefaultBasePath(envId: number | null, location: string | null) {
+		const params = new URLSearchParams({ name: '__placeholder__' });
+		if (envId) params.set('env', String(envId));
+		if (location) params.set('location', location);
+		try {
+			const r = await fetch(`/api/stacks/default-path?${params}`);
+			if (r.ok) {
+				const data = await r.json();
+				// Extract base dir by removing the placeholder name
+				defaultStackDir = data.stackDir.replace('/__placeholder__', '');
+			}
+		} catch {
+			// Ignore fetch errors
+		}
+	}
+
+	// Fetch default base path when modal opens or environment changes
+	$effect(() => {
+		if (!open || mode !== 'create') return;
+		const envId = $currentEnvironment?.id ?? null;
+		const location = $appSettings.primaryStackLocation;
+		fetchDefaultBasePath(envId, location);
+	});
+
 	// Auto-update default paths when stack name changes in create mode
+	// This unified effect handles both default paths and browsed directory paths
 	$effect(() => {
 		if (mode !== 'create' || !open) return;
-		// Don't overwrite if user has browsed and selected a path
-		if (pathSource === 'browsed') return;
 
 		const name = newStackName.trim();
-		const location = $appSettings.primaryStackLocation;
 
+		// User selected a specific file - paths are locked, don't touch them
+		if (pathSource === 'custom') return;
+
+		// No name entered yet - clear paths but preserve browsed state
 		if (!name) {
-			// Clear paths when no name
 			workingComposePath = '';
 			workingEnvPath = '';
 			autoComputedComposePath = '';
-			pathSource = null;
+			if (!browsedBaseDirectory) {
+				pathSource = null;
+			}
 			return;
 		}
 
-		// Fetch the actual absolute path from the backend
-		const envId = $currentEnvironment?.id ?? null;
-		const fetchDefaultPath = async () => {
-			try {
-				const params = new URLSearchParams({ name });
-				if (envId) params.set('env', String(envId));
-				if (location) {
-					params.set('location', location);
-				}
-				const response = await fetch(`/api/stacks/default-path?${params}`);
-				if (response.ok) {
-					const data = await response.json();
-					// Check if user has customized before updating auto-computed
-					// Compare current working path against OLD auto path (before we update it)
-					const userHasCustomized = workingComposePath !== '' &&
-						workingComposePath !== autoComputedComposePath;
-					// Track the auto-computed path
-					autoComputedComposePath = data.composePath;
-					// Only update working paths if user hasn't customized
-					if (!userHasCustomized) {
-						workingComposePath = data.composePath;
-						workingEnvPath = data.envPath;
-						pathSource = data.source || 'default';
-					}
-				}
-			} catch (e) {
-				console.error('Failed to fetch default path:', e);
-			}
-		};
-		fetchDefaultPath();
+		// User browsed and selected a directory - build path from that base
+		if (browsedBaseDirectory) {
+			workingComposePath = `${browsedBaseDirectory}/${name}/compose.yaml`;
+			workingEnvPath = `${browsedBaseDirectory}/${name}/.env`;
+			pathSource = 'browsed';
+			return;
+		}
+
+		// Use pre-fetched default base directory
+		if (defaultStackDir) {
+			const dir = `${defaultStackDir}/${name}`;
+			autoComputedComposePath = `${dir}/compose.yaml`;
+			workingComposePath = `${dir}/compose.yaml`;
+			workingEnvPath = `${dir}/.env`;
+			pathSource = 'default';
+		}
 	});
 </script>
 
@@ -1356,7 +1429,7 @@ services:
 							<AlertCircle class="w-4 h-4 shrink-0 text-amber-500 mt-0.5" />
 							<div class="flex-1 min-w-0">
 								<p class="text-sm text-zinc-600 dark:text-zinc-400 mb-2">
-									<span class="font-medium text-amber-800 dark:text-amber-300">Untracked stack.</span> Select the compose file location to start managing this stack with Dockhand.
+									<span class="font-medium text-amber-800 dark:text-amber-300">Untracked stack</span> — this stack is running in Docker but Dockhand doesn't know where its compose file is stored on disk. Browse to locate the file to start editing and managing it.
 								</p>
 								{#if stackContainers.length > 0}
 									<div class="text-xs text-zinc-500 dark:text-zinc-400">
@@ -1544,10 +1617,10 @@ services:
 					<Button class="w-36" onclick={() => handleSave(true)} disabled={saving || loading || (needsFileLocation && !workingComposePath.trim())}>
 						{#if saving && savingWithRestart}
 							<Loader2 class="w-4 h-4 mr-2 animate-spin" />
-							Restarting...
+							Deploying...
 						{:else}
 							<Play class="w-4 h-4 mr-2" />
-							Save & restart
+							Save & redeploy
 						{/if}
 					</Button>
 				{/if}

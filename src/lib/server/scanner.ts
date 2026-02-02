@@ -14,6 +14,9 @@ import {
 } from './docker';
 import { getEnvironment, getEnvSetting, getSetting } from './db';
 import { sendEventNotification } from './notifications';
+import { getHostDockerSocket, getHostDataDir, extractUidFromSocketPath } from './host-path';
+import { resolve } from 'node:path';
+import { mkdir, chown } from 'node:fs/promises';
 
 export type ScannerType = 'none' | 'grype' | 'trivy' | 'both';
 
@@ -66,8 +69,16 @@ export async function sendVulnerabilityNotifications(
 const GRYPE_VOLUME_NAME = 'dockhand-grype-db';
 const TRIVY_VOLUME_NAME = 'dockhand-trivy-db';
 
+// Scanner cache directory for rootless Docker (bind mounts instead of volumes)
+const DATA_DIR = process.env.DATA_DIR || '/app/data';
+const SCANNER_CACHE_DIR = 'scanner-cache';
+
 // Track running scanner instances to detect concurrent scans
 const runningScanners = new Map<string, number>(); // key: "grype" or "trivy", value: count
+
+// Track in-progress scans per image to prevent duplicate scans
+// Key: "{scannerType}:{imageName}", Value: Promise that resolves to the scan result
+const inProgressScans = new Map<string, Promise<string>>();
 
 // Default CLI arguments for scanners (image name is substituted for {image})
 export const DEFAULT_GRYPE_ARGS = '-o json -v {image}';
@@ -381,6 +392,43 @@ async function ensureVolume(volumeName: string, envId?: number): Promise<void> {
 	}
 }
 
+/**
+ * Ensure scanner cache directory exists with correct ownership for rootless Docker.
+ * Creates the directory in Dockhand's data volume and chowns it to the target UID.
+ *
+ * This is needed because Docker volumes are always created with root ownership,
+ * but rootless Docker scanners run as a non-root user (e.g., UID 1000).
+ * By using a bind mount from Dockhand's data directory (which Dockhand can chown
+ * since it runs as root), the scanner can write to its cache.
+ *
+ * @param scannerType - 'grype' or 'trivy'
+ * @param uid - Target UID for ownership (e.g., '1000')
+ * @returns The HOST path to the cache directory (for bind mounting into scanner)
+ */
+async function ensureScannerCacheDir(
+	scannerType: 'grype' | 'trivy',
+	uid: string
+): Promise<string> {
+	const containerPath = resolve(DATA_DIR, SCANNER_CACHE_DIR, scannerType);
+
+	// Create directory if needed (recursive)
+	await mkdir(containerPath, { recursive: true });
+
+	// Chown to the target UID so scanner can write
+	const uidNum = parseInt(uid, 10);
+	await chown(containerPath, uidNum, uidNum);
+	console.log(`[Scanner] Set ownership of ${containerPath} to ${uid}:${uid}`);
+
+	// Return the HOST path for bind mounting
+	const hostDataDir = getHostDataDir();
+	if (hostDataDir) {
+		return `${hostDataDir}/${SCANNER_CACHE_DIR}/${scannerType}`;
+	}
+
+	// Fallback: not running in Docker, use container path as-is
+	return containerPath;
+}
+
 // Run scanner in a fresh container with volume-cached database
 async function runScannerContainer(
 	scannerImage: string,
@@ -390,9 +438,39 @@ async function runScannerContainer(
 	envId?: number,
 	onOutput?: (line: string) => void
 ): Promise<string> {
-	// Ensure database cache volume exists
-	const volumeName = scannerType === 'grype' ? GRYPE_VOLUME_NAME : TRIVY_VOLUME_NAME;
-	await ensureVolume(volumeName, envId);
+	// Check if a scan for this exact image is already in progress
+	// This prevents duplicate scans when multiple containers use the same image
+	const scanKey = `${scannerType}:${imageName}:${envId ?? 'local'}`;
+	const existingScan = inProgressScans.get(scanKey);
+	if (existingScan) {
+		console.log(`[Scanner] Reusing in-progress ${scannerType} scan for: ${imageName}`);
+		return existingScan;
+	}
+
+	// Create the actual scan promise
+	const scanPromise = runScannerContainerImpl(scannerImage, scannerType, imageName, cmd, envId, onOutput);
+
+	// Register it so concurrent requests can reuse it
+	inProgressScans.set(scanKey, scanPromise);
+
+	try {
+		return await scanPromise;
+	} finally {
+		// Clean up the tracking entry when done
+		inProgressScans.delete(scanKey);
+	}
+}
+
+// Internal implementation of scanner container run
+async function runScannerContainerImpl(
+	scannerImage: string,
+	scannerType: 'grype' | 'trivy',
+	imageName: string,
+	cmd: string[],
+	envId?: number,
+	onOutput?: (line: string) => void
+): Promise<string> {
+	console.log(`[Scanner] Starting ${scannerType} scan for image: ${imageName}, envId: ${envId ?? 'local'}`);
 
 	// Check if another scanner of the same type is already running
 	// If so, use a unique cache subdirectory to avoid lock conflicts
@@ -407,10 +485,66 @@ async function runScannerContainer(
 	const basePath = scannerType === 'grype' ? '/cache/grype' : '/cache/trivy';
 	const dbPath = scanId ? `${basePath}${scanId}` : basePath;
 
+	// Detect the host Docker socket path based on connection type
+	// For local socket environments, detect the actual host socket path (handles rootless Docker)
+	// For remote environments (hawser/direct with host), scanner runs remotely and uses standard path
+	const env = envId ? await getEnvironment(envId) : undefined;
+	const connectionType = env?.connectionType;
+
+	// Determine if this is a local socket environment:
+	// - connectionType === 'socket' (explicit)
+	// - connectionType is null/undefined (default behavior)
+	// - connectionType === 'direct' but no host specified (legacy local environments)
+	const isLocalSocket = !connectionType ||
+		connectionType === 'socket' ||
+		(connectionType === 'direct' && !env?.host);
+
+	let hostSocketPath: string;
+	let containerUser: string | undefined;
+
+	if (isLocalSocket) {
+		// Local socket environment - detect host socket path (handles rootless Docker)
+		hostSocketPath = getHostDockerSocket();
+		console.log(`[Scanner] Local socket scan (${connectionType || 'default'}) - detected host Docker socket: ${hostSocketPath}`);
+
+		// For user-specific Docker sockets, run scanner as that user
+		// e.g., /run/user/1000/docker.sock -> run as UID 1000
+		const uid = extractUidFromSocketPath(hostSocketPath);
+		if (uid) {
+			containerUser = uid;
+			console.log(`[Scanner] Rootless Docker detected (UID ${containerUser})`);
+		}
+	} else {
+		// Remote environment (direct with host/hawser-standard/hawser-edge)
+		// Scanner runs on remote host, uses remote host's standard Docker socket
+		hostSocketPath = '/var/run/docker.sock';
+		console.log(`[Scanner] Remote scan (${connectionType}, host: ${env?.host}) - using standard socket path: ${hostSocketPath}`);
+	}
+
+	// Determine cache storage strategy based on environment
+	// For rootless Docker: use bind mount from data directory with correct ownership
+	// For standard Docker: use named volume (root-owned is fine when running as root)
+	let cacheBind: string;
+	const volumeName = scannerType === 'grype' ? GRYPE_VOLUME_NAME : TRIVY_VOLUME_NAME;
+
+	if (containerUser) {
+		// Rootless Docker: use bind mount from data directory with correct ownership
+		const hostCachePath = await ensureScannerCacheDir(scannerType, containerUser);
+		cacheBind = `${hostCachePath}:${basePath}`;
+		console.log(`[Scanner] Rootless mode - using bind mount: ${cacheBind}`);
+	} else {
+		// Standard Docker: use named volume (root-owned is fine when running as root)
+		await ensureVolume(volumeName, envId);
+		cacheBind = `${volumeName}:${basePath}`;
+		console.log(`[Scanner] Standard mode - using volume: ${volumeName}`);
+	}
+
 	const binds = [
-		'/var/run/docker.sock:/var/run/docker.sock:ro',
-		`${volumeName}:${basePath}` // Always mount to base path
+		`${hostSocketPath}:/var/run/docker.sock:ro`,
+		cacheBind
 	];
+
+	console.log(`[Scanner] Container bind mounts: ${JSON.stringify(binds)}`);
 
 	// Environment variables to ensure scanners use the correct cache path
 	// For concurrent scans, use a unique subdirectory
@@ -421,7 +555,11 @@ async function runScannerContainer(
 	if (scanId) {
 		console.log(`[Scanner] Concurrent scan detected - using unique cache dir: ${dbPath}`);
 	}
-	console.log(`[Scanner] Running ${scannerType} with volume ${volumeName} mounted at ${basePath}`);
+	console.log(`[Scanner] Running ${scannerType} with cache mounted at ${basePath}`);
+	console.log(`[Scanner] Container command: ${cmd.join(' ')}`);
+	if (containerUser) {
+		console.log(`[Scanner] Running scanner container as UID ${containerUser} to match socket owner`);
+	}
 
 	try {
 		// Run the scanner container
@@ -431,6 +569,7 @@ async function runScannerContainer(
 			binds,
 			env: envVars,
 			name: `dockhand-${scannerType}-${Date.now()}`,
+			user: containerUser,
 			envId,
 			onStderr: (data) => {
 				// Stream stderr lines for real-time progress output
@@ -442,6 +581,15 @@ async function runScannerContainer(
 				}
 			}
 		});
+
+		console.log(`[Scanner] ${scannerType} container completed, output length: ${output.length}`);
+		if (output.length === 0) {
+			console.error(`[Scanner] WARNING: Empty output from ${scannerType} container`);
+			console.error(`[Scanner] This may indicate the scanner couldn't access Docker socket`);
+			console.error(`[Scanner] Host socket path used: ${hostSocketPath}`);
+		} else if (output.length < 100) {
+			console.log(`[Scanner] ${scannerType} output preview: ${output}`);
+		}
 
 		return output;
 	} finally {

@@ -20,6 +20,9 @@ import { listComposeStacks } from '$lib/server/stacks';
 import { authorize } from '$lib/server/authorize';
 import { parseLabels } from '$lib/utils/label-colors';
 
+// Skip disk usage collection (Synology NAS performance fix)
+const SKIP_DF_COLLECTION = process.env.SKIP_DF_COLLECTION === 'true' || process.env.SKIP_DF_COLLECTION === '1';
+
 // Helper to add timeout to promises
 function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
 	return Promise.race([
@@ -200,13 +203,14 @@ export const GET: RequestHandler = async ({ cookies, url }) => {
 				envStats.online = true;
 
 				// Fetch all data in parallel (with 10 second timeout per operation)
+				// Disk usage can be disabled with SKIP_DF_COLLECTION for Synology NAS devices
 				const [containers, images, volumes, networks, stacks, diskUsage] = await Promise.all([
 					withTimeout(listContainers(true, env.id).catch(() => []), 10000, []),
 					withTimeout(listImages(env.id).catch(() => []), 10000, []),
 					withTimeout(listVolumes(env.id).catch(() => []), 10000, []),
 					withTimeout(listNetworks(env.id).catch(() => []), 10000, []),
 					withTimeout(listComposeStacks(env.id).catch(() => []), 10000, []),
-					withTimeout(getDiskUsage(env.id).catch(() => null), 10000, null)
+					SKIP_DF_COLLECTION ? Promise.resolve(null) : withTimeout(getDiskUsage(env.id).catch(() => null), 10000, null)
 				]);
 
 				// Process containers

@@ -53,8 +53,8 @@
 				method: 'PUT',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
-					current_password: currentPassword,
-					new_password: newPassword
+					currentPassword: currentPassword,
+					newPassword: newPassword
 				})
 			});
 

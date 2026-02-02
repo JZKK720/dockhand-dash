@@ -1,5 +1,59 @@
 [
   {
+    "version": "1.0.14",
+    "date": "2026-01-31",
+    "changes": [
+      { "type": "fix", "text": "Fix environment variables in .env not interpolated during remote deployment" },
+      { "type": "fix", "text": "Fix stack variables not re-injected during stack start/stop" },
+      { "type": "fix", "text": "Fix time format 12/24 setting not respected in header clock" },
+      { "type": "fix", "text": "Fix skip TLS verification not saved on new environment" }
+    ],
+    "imageTag": "fnsys/dockhand:v1.0.14"
+  },
+  {
+    "version": "1.0.13",
+    "date": "2026-01-23",
+    "changes": [
+      { "type": "feature", "text": "Add DISABLE_LOCAL_LOGIN env var to hide local password login when SSO/LDAP is configured" },
+      { "type": "feature", "text": "Add ntfy authentication support (user:pass@host/topic format)" },
+      { "type": "feature", "text": "Sortable health column in containers grid (unhealthy containers first)" },
+      { "type": "feature", "text": "GPU device configuration in container create/edit/inspect" },
+      { "type": "feature", "text": "Editor font setting with expanded monospace font options" },
+      { "type": "feature", "text": "Dedicated NFS/CIFS form fields in create volume modal" },
+      { "type": "feature", "text": "Scheduled image pruning per environment" },
+      { "type": "feature", "text": "Git stack env populate button to preview overridable variables before deploy" },
+      { "type": "fix", "text": "Fix vulnerability scanning failing with rootless Docker" },
+      { "type": "fix", "text": "Honor DATA_DIR env var in hawser SQLite operations" },
+      { "type": "fix", "text": "Show detailed error messages when notification test fails" },
+      { "type": "fix", "text": "Fix compose file browse in create mode showing default path instead of selected file" },
+      { "type": "fix", "text": "Fix custom env file path not preserved in create mode" },
+      { "type": "fix", "text": "Fix git stacks creating duplicate compose.yaml alongside repo file" },
+      { "type": "fix", "text": "Fix env vars not showing after stack create" },
+      { "type": "fix", "text": "Fix stack path defaults accidentally enforced over custom paths" },
+      { "type": "fix", "text": "Fix adopted stack save & restart breaking paths and env vars" },
+      { "type": "fix", "text": "Add more information to container audit logs including diff of changes" },
+      { "type": "fix", "text": "Preserve container settings on restart and auto-update" }
+    ],
+    "imageTag": "fnsys/dockhand:v1.0.13"
+  },
+  {
+    "version": "1.0.12",
+    "date": "2026-01-22",
+    "changes": [
+      { "type": "feature", "text": "Add SKIP_DF_COLLECTION env var to disable slow disk usage collection on NAS devices" },
+      { "type": "fix", "text": "Fix terminal/shell connections to direct TLS/mTLS and Hawser Standard environments" },
+      { "type": "fix", "text": "Fix crash when Hawser agent is stopped from Dockhand" },
+      { "type": "fix", "text": "Skip auto-update for SHA-pinned images (image@sha256:...)" },
+      { "type": "fix", "text": "Fix pending updates not cleared when containers or stacks are deleted" },
+      { "type": "fix", "text": "Fix adopted stacks using wrong .env path from internal directory instead of original location" },
+      { "type": "fix", "text": "Improve /login audit logs information" },
+      { "type": "fix", "text": "Fix login/logout screen refresh issue" },
+      { "type": "fix", "text": "Fix password change not persisting" },
+      { "type": "fix", "text": "Fix audit log page showing empty values" }
+    ],
+    "imageTag": "fnsys/dockhand:v1.0.12"
+  },
+  {
     "version": "1.0.11",
     "date": "2026-01-20",
     "changes": [
