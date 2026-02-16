@@ -121,6 +121,9 @@ async function sendToAppriseUrl(url: string, payload: NotificationPayload): Prom
 			case 'slack':
 			case 'slacks':
 				return await sendSlack(url, payload);
+			case 'mmost':
+			case 'mmosts':
+				return await sendMattermost(url, payload);
 			case 'tgram':
 				return await sendTelegram(url, payload);
 			case 'gotify':
@@ -207,6 +210,54 @@ async function sendSlack(appriseUrl: string, payload: NotificationPayload): Prom
 	}
 }
 
+// Mattermost webhook
+async function sendMattermost(appriseUrl: string, payload: NotificationPayload): Promise<boolean> {
+	// mmost://[botname@]hostname[:port][/path]/token or mmosts://...
+	const isSecure = appriseUrl.startsWith('mmosts');
+	const protocol = isSecure ? 'https' : 'http';
+
+	// Remove the scheme
+	let urlPart = appriseUrl.replace(/^mmosts?:\/\//, '');
+
+	// Check for botname (username@hostname format)
+	let username: string | undefined;
+	const atIndex = urlPart.indexOf('@');
+	if (atIndex !== -1) {
+		username = urlPart.substring(0, atIndex);
+		urlPart = urlPart.substring(atIndex + 1);
+	}
+
+	// The token is the last segment, everything else is hostname[:port][/path]
+	const lastSlashIndex = urlPart.lastIndexOf('/');
+	if (lastSlashIndex === -1) {
+		console.error('[Notifications] Invalid Mattermost URL format. Expected: mmost://[botname@]hostname[:port][/path]/token');
+		return false;
+	}
+
+	const token = urlPart.substring(lastSlashIndex + 1);
+	const hostAndPath = urlPart.substring(0, lastSlashIndex);
+
+	// Build the webhook URL: {protocol}://{hostname}[:{port}][/{path}]/hooks/{token}
+	const url = `${protocol}://${hostAndPath}/hooks/${token}`;
+
+	const envTag = payload.environmentName ? ` \`${payload.environmentName}\`` : '';
+	const body: Record<string, string> = {
+		text: `*${payload.title}*${envTag}\n${payload.message}`
+	};
+
+	if (username) {
+		body.username = username;
+	}
+
+	const response = await fetch(url, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body)
+	});
+
+	return response.ok;
+}
+
 // Telegram
 async function sendTelegram(appriseUrl: string, payload: NotificationPayload): Promise<NotificationResult> {
 	// tgram://bot_token/chat_id
@@ -248,14 +299,19 @@ async function sendTelegram(appriseUrl: string, payload: NotificationPayload): P
 // Gotify
 async function sendGotify(appriseUrl: string, payload: NotificationPayload): Promise<NotificationResult> {
 	// gotify://hostname/token or gotifys://hostname/token
+	// gotify://hostname/subpath/token (subpath support)
 	const match = appriseUrl.match(/^gotifys?:\/\/([^/]+)\/(.+)/);
 	if (!match) {
 		return { success: false, error: 'Invalid Gotify URL format. Expected: gotify://hostname/token' };
 	}
 
-	const [, hostname, token] = match;
+	const [, hostname, pathPart] = match;
 	const protocol = appriseUrl.startsWith('gotifys') ? 'https' : 'http';
-	const url = `${protocol}://${hostname}/message?token=${token}`;
+	// Token is always the last path segment; anything before it is a subpath
+	const lastSlash = pathPart.lastIndexOf('/');
+	const subpath = lastSlash >= 0 ? pathPart.substring(0, lastSlash) : '';
+	const token = lastSlash >= 0 ? pathPart.substring(lastSlash + 1) : pathPart;
+	const url = `${protocol}://${hostname}${subpath ? '/' + subpath : ''}/message?token=${token}`;
 
 	try {
 		const response = await fetch(url, {
@@ -289,14 +345,26 @@ async function sendNtfy(appriseUrl: string, payload: NotificationPayload): Promi
 	const path = appriseUrl.replace(/^ntfys?:\/\//, '');
 
 	let url: string;
-	let auth: string | null = null;
+	let authHeader: string | null = null;
 
-	// Check for user:pass@host/topic format
-	const authMatch = path.match(/^([^:]+):([^@]+)@(.+)$/);
-	if (authMatch) {
-		const [, user, pass, hostAndTopic] = authMatch;
-		auth = Buffer.from(`${user}:${pass}`).toString('base64');
+	// Check for user:pass@host/topic format (Basic auth)
+	const basicMatch = path.match(/^([^:]+):([^@]+)@(.+)$/);
+	if (basicMatch) {
+		const [, user, pass, hostAndTopic] = basicMatch;
+		const basic = Buffer.from(`${user}:${pass}`).toString('base64');
+		authHeader = `Basic ${basic}`;
 		url = `${isSecure ? 'https' : 'http'}://${hostAndTopic}`;
+	} else if (path.includes('@') && path.includes('/')) {
+		// token@host/topic -> Bearer token auth
+		const tokenMatch = path.match(/^([^@]+)@(.+)$/);
+		if (tokenMatch) {
+			const [, token, hostAndTopic] = tokenMatch;
+			authHeader = `Bearer ${token}`;
+			url = `${isSecure ? 'https' : 'http'}://${hostAndTopic}`;
+		} else {
+			// Fallback to custom server without auth
+			url = `${isSecure ? 'https' : 'http'}://${path}`;
+		}
 	} else if (path.includes('/')) {
 		// Custom server without auth
 		url = `${isSecure ? 'https' : 'http'}://${path}`;
@@ -311,8 +379,8 @@ async function sendNtfy(appriseUrl: string, payload: NotificationPayload): Promi
 		'Tags': payload.type || 'info'
 	};
 
-	if (auth) {
-		headers['Authorization'] = `Basic ${auth}`;
+	if (authHeader) {
+		headers['Authorization'] = authHeader;
 	}
 
 	try {
@@ -443,6 +511,7 @@ function mapActionToEventType(action: string): NotificationEventType | null {
 		'kill': 'container_exited',
 		'oom': 'container_oom',
 		'health_status: unhealthy': 'container_unhealthy',
+		'health_status: healthy': 'container_healthy',
 		'pull': 'image_pulled'
 	};
 	return mapping[action] || null;

@@ -11,8 +11,10 @@
 	import { Label } from '$lib/components/ui/label';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import * as Select from '$lib/components/ui/select';
-	import { Trash2, Upload, RefreshCw, Play, Search, Layers, Server, ShieldCheck, CheckSquare, Square, Tag, Check, XCircle, Icon, AlertTriangle, X, Images, Copy, Download, ChevronRight, ChevronDown, Loader2, ArrowUp, ArrowDown, ArrowUpDown, CircleDashed } from 'lucide-svelte';
+	import { Trash2, Upload, RefreshCw, Play, Search, Layers, Server, ShieldCheck, CheckSquare, Square, Tag, Check, XCircle, Icon, AlertTriangle, X, Images, Copy, Download, ChevronRight, ChevronDown, Loader2, ArrowUp, ArrowDown, ArrowUpDown, CircleDashed, CircleDot, Circle, Filter } from 'lucide-svelte';
 	import { broom, whale } from '@lucide/lab';
+	import * as Tooltip from '$lib/components/ui/tooltip';
+	import { copyToClipboard } from '$lib/utils/clipboard';
 	import ConfirmPopover from '$lib/components/ConfirmPopover.svelte';
 	import BatchOperationModal from '$lib/components/BatchOperationModal.svelte';
 	import ImageHistoryModal from './ImageHistoryModal.svelte';
@@ -106,6 +108,10 @@
 	let sortField = $state<SortField>('created');
 	let sortDirection = $state<SortDirection>('desc');
 
+	// Filter state
+	type UsageFilter = 'all' | 'in-use' | 'unused';
+	let usageFilter = $state<UsageFilter>('all');
+
 	// Expanded rows state
 	let expandedRepos = $state<Set<string>>(new Set());
 
@@ -140,17 +146,20 @@
 	let batchOpTitle = $state('');
 	let batchOpOperation = $state('');
 	let batchOpItems = $state<Array<{ id: string; name: string }>>([]);
+	let batchOpTotalSize = $state<number | undefined>(undefined);
 
 	// Copy ID state
 	let copiedId = $state<string | null>(null);
+	let copyIdFailed = $state(false);
 
 	async function copyImageId(imageId: string) {
-		try {
-			await navigator.clipboard.writeText(imageId);
+		const ok = await copyToClipboard(imageId);
+		if (ok) {
 			copiedId = imageId;
 			pendingTimeouts.push(setTimeout(() => copiedId = null, 2000));
-		} catch (err) {
-			console.error('Failed to copy:', err);
+		} else {
+			copyIdFailed = true;
+			pendingTimeouts.push(setTimeout(() => copyIdFailed = false, 2000));
 		}
 	}
 
@@ -187,11 +196,21 @@
 
 		for (const image of images) {
 			if (image.tags.length === 0) {
-				// Handle untagged images
-				const key = '<none>';
+				// Handle untagged images - try to extract repo name from RepoDigests
+				let repoName = '<none>';
+				if (image.repoDigests && image.repoDigests.length > 0) {
+					// RepoDigests format: "nginx@sha256:abc123" or "registry.example.com/myapp@sha256:abc123"
+					const digest = image.repoDigests[0];
+					const atIndex = digest.indexOf('@');
+					if (atIndex > 0) {
+						repoName = digest.slice(0, atIndex);
+					}
+				}
+
+				const key = repoName;
 				if (!groups.has(key)) {
 					groups.set(key, {
-						repoName: '<none>',
+						repoName,
 						tags: [],
 						totalSize: 0,
 						latestCreated: 0,
@@ -201,7 +220,7 @@
 				}
 				const group = groups.get(key)!;
 				group.tags.push({
-					tag: image.id.slice(7, 19),
+					tag: repoName === '<none>' ? image.id.slice(7, 19) : '<none>',
 					fullRef: image.id,
 					imageId: image.id,
 					size: image.size,
@@ -268,8 +287,18 @@
 		const query = searchQuery.toLowerCase().trim();
 
 		let filtered = groupedImages;
+
+		// Apply usage filter
+		if (usageFilter !== 'all') {
+			filtered = filtered.filter(group => {
+				const isInUse = group.containers > 0;
+				return usageFilter === 'in-use' ? isInUse : !isInUse;
+			});
+		}
+
+		// Apply search filter
 		if (query) {
-			filtered = groupedImages.filter(group => {
+			filtered = filtered.filter(group => {
 				if (group.repoName.toLowerCase().includes(query)) return true;
 				if (group.tags.some(t => t.tag.toLowerCase().includes(query))) return true;
 				if (group.tags.some(t => t.imageId.toLowerCase().includes(query))) return true;
@@ -442,6 +471,7 @@
 				: img.id.slice(7, 19);
 			return { id: img.id, name: displayName };
 		});
+		batchOpTotalSize = selectedInFilter.reduce((sum, img) => sum + img.size, 0);
 		showBatchOpModal = true;
 	}
 
@@ -457,7 +487,15 @@
 			const response = await fetch(appendEnvParam('/api/prune/images', envId), { method: 'POST' });
 			if (response.ok) {
 				pruneStatus = 'success';
-				toast.success('Dangling images pruned');
+				const data = await response.json();
+				const deleted = data.result?.ImagesDeleted;
+				const spaceReclaimed = data.result?.SpaceReclaimed ?? 0;
+				const count = deleted?.length ?? 0;
+				if (count > 0) {
+					toast.success(`Pruned ${count} image${count !== 1 ? 's' : ''}, freed ${formatBytes(spaceReclaimed)}`);
+				} else {
+					toast.success('No dangling images to prune');
+				}
 				await fetchImages();
 			} else {
 				pruneStatus = 'error';
@@ -477,7 +515,15 @@
 			const response = await fetch(appendEnvParam('/api/prune/images?dangling=false', envId), { method: 'POST' });
 			if (response.ok) {
 				pruneUnusedStatus = 'success';
-				toast.success('Unused images pruned');
+				const data = await response.json();
+				const deleted = data.result?.ImagesDeleted;
+				const spaceReclaimed = data.result?.SpaceReclaimed ?? 0;
+				const count = deleted?.length ?? 0;
+				if (count > 0) {
+					toast.success(`Pruned ${count} image${count !== 1 ? 's' : ''}, freed ${formatBytes(spaceReclaimed)}`);
+				} else {
+					toast.success('No unused images to prune');
+				}
 				await fetchImages();
 			} else {
 				pruneUnusedStatus = 'error';
@@ -492,6 +538,7 @@
 
 	async function removeImage(id: string, tagName: string) {
 		deleteError = null;
+		const imageSize = images.find(img => img.id === id)?.size;
 		try {
 			const response = await fetch(appendEnvParam(`/api/images/${encodeURIComponent(id)}?force=true`, envId), { method: 'DELETE' });
 			if (!response.ok) {
@@ -503,7 +550,8 @@
 				}, 5000));
 				return;
 			}
-			toast.success(`Deleted ${tagName}`);
+			const sizeStr = imageSize ? ` (${formatBytes(imageSize)})` : '';
+			toast.success(`Deleted ${tagName}${sizeStr}`);
 			await fetchImages();
 		} catch (error) {
 			console.error('Failed to remove image:', error);
@@ -584,6 +632,14 @@
 		return `${(mb / 1024).toFixed(2)} GB`;
 	}
 
+	function formatBytes(bytes: number): string {
+		if (bytes === 0) return '0 B';
+		const k = 1024;
+		const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+		const i = Math.floor(Math.log(bytes) / Math.log(k));
+		return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+	}
+
 	function formatImageDate(timestamp: number): string {
 		return formatDate(new Date(timestamp * 1000));
 	}
@@ -656,7 +712,7 @@
 			icon={Images}
 			title="Images"
 			count={sortedGroups.length}
-			total={searchQuery && sortedGroups.length !== groupedImages.length ? groupedImages.length : undefined}
+			total={(searchQuery || usageFilter !== 'all') && sortedGroups.length !== groupedImages.length ? groupedImages.length : undefined}
 		/>
 		<div class="flex flex-wrap items-center gap-2">
 			<div class="relative">
@@ -669,6 +725,34 @@
 					class="pl-8 h-8 w-48 text-sm"
 				/>
 			</div>
+			<Select.Root type="single" bind:value={usageFilter}>
+				<Select.Trigger size="sm" class="w-28 text-sm">
+					{#if usageFilter === 'all'}
+						<Filter class="w-3.5 h-3.5 mr-1.5 text-muted-foreground shrink-0" />
+						<span class="text-muted-foreground">All</span>
+					{:else if usageFilter === 'in-use'}
+						<CircleDot class="w-3.5 h-3.5 mr-1.5 text-emerald-500 shrink-0" />
+						<span>In use</span>
+					{:else}
+						<Circle class="w-3.5 h-3.5 mr-1.5 text-muted-foreground shrink-0" />
+						<span>Unused</span>
+					{/if}
+				</Select.Trigger>
+				<Select.Content>
+					<Select.Item value="all">
+						<Filter class="w-4 h-4 mr-2 text-muted-foreground" />
+						All
+					</Select.Item>
+					<Select.Item value="in-use">
+						<CircleDot class="w-4 h-4 mr-2 text-emerald-500" />
+						In use
+					</Select.Item>
+					<Select.Item value="unused">
+						<Circle class="w-4 h-4 mr-2 text-muted-foreground" />
+						Unused
+					</Select.Item>
+				</Select.Content>
+			</Select.Root>
 			{#if $canAccess('images', 'remove')}
 			<ConfirmPopover
 				open={confirmPrune}
@@ -1134,6 +1218,7 @@
 	items={batchOpItems}
 	envId={envId ?? undefined}
 	options={{ force: true }}
+	totalSize={batchOpTotalSize}
 	onClose={() => showBatchOpModal = false}
 	onComplete={handleBatchComplete}
 />

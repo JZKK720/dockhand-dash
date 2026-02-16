@@ -779,6 +779,7 @@ export const NOTIFICATION_EVENT_TYPES = [
 	{ id: 'container_restarted', label: 'Container restarted', description: 'When a container restarts (manual or automatic)', group: 'container', scope: 'environment' },
 	{ id: 'container_exited', label: 'Container exited', description: 'When a container exits unexpectedly', group: 'container', scope: 'environment' },
 	{ id: 'container_unhealthy', label: 'Container unhealthy', description: 'When a container health check fails', group: 'container', scope: 'environment' },
+	{ id: 'container_healthy', label: 'Container healthy', description: 'When a container health check recovers', group: 'container', scope: 'environment' },
 	{ id: 'container_oom', label: 'Out of memory', description: 'When a container is killed due to out of memory', group: 'container', scope: 'environment' },
 	{ id: 'container_updated', label: 'Container updated', description: 'When a container image is updated', group: 'container', scope: 'environment' },
 	{ id: 'image_pulled', label: 'Image pulled', description: 'When a new image is pulled', group: 'container', scope: 'environment' },
@@ -1148,7 +1149,11 @@ export async function updateAuthSettings(data: Partial<AuthSettingsData>): Promi
 
 	if (data.authEnabled !== undefined) updateData.authEnabled = data.authEnabled;
 	if (data.defaultProvider !== undefined) updateData.defaultProvider = data.defaultProvider;
-	if (data.sessionTimeout !== undefined) updateData.sessionTimeout = data.sessionTimeout;
+	if (data.sessionTimeout !== undefined) {
+		// Cap session timeout to safe maximum (30 days)
+		const MAX_SESSION_TIMEOUT = 2592000; // 30 days in seconds
+		updateData.sessionTimeout = Math.min(Math.max(1, data.sessionTimeout), MAX_SESSION_TIMEOUT);
+	}
 
 	// Get existing row's id (may not be 1 after db reset/migration)
 	const existing = await db.select({ id: authSettings.id }).from(authSettings).limit(1);
@@ -2614,6 +2619,34 @@ export async function getStackSource(stackName: string, environmentId?: number |
 	} as StackSourceWithRepo;
 }
 
+export async function getStackSourceByComposePath(composePath: string, environmentId?: number | null): Promise<StackSourceWithRepo | null> {
+	const envCondition = environmentId !== undefined && environmentId !== null
+		? eq(stackSources.environmentId, environmentId)
+		: isNull(stackSources.environmentId);
+
+	const results = await db.select().from(stackSources)
+		.where(and(eq(stackSources.composePath, composePath), envCondition));
+
+	if (!results[0]) return null;
+	const row = results[0];
+
+	let repository = null;
+	let gitStackData = null;
+
+	if (row.gitRepositoryId) {
+		repository = await getGitRepository(row.gitRepositoryId);
+	}
+	if (row.gitStackId) {
+		gitStackData = await getGitStack(row.gitStackId);
+	}
+
+	return {
+		...row,
+		repository,
+		gitStack: gitStackData
+	} as StackSourceWithRepo;
+}
+
 export async function getStackSources(environmentId?: number | null): Promise<StackSourceWithRepo[]> {
 	let results;
 	if (environmentId !== undefined && environmentId !== null) {
@@ -2950,7 +2983,7 @@ export async function deleteOldScans(keepDays = 30): Promise<number> {
 export type AuditAction =
 	| 'create' | 'update' | 'delete' | 'start' | 'stop' | 'restart' | 'down'
 	| 'pause' | 'unpause' | 'pull' | 'push' | 'prune' | 'login'
-	| 'logout' | 'view' | 'exec' | 'connect' | 'disconnect' | 'deploy' | 'sync' | 'rename';
+	| 'logout' | 'view' | 'exec' | 'connect' | 'disconnect' | 'deploy' | 'sync' | 'rename' | 'webhook';
 
 export type AuditEntityType =
 	| 'container' | 'image' | 'stack' | 'volume' | 'network'

@@ -70,6 +70,7 @@
 		restartMaxRetries: number | '';
 		networkMode: string;
 		startAfterCreate?: boolean;
+		repullImage?: boolean;
 		// Port mappings
 		portMappings: { hostPort: string; containerPort: string; protocol: string }[];
 		// Volume mappings
@@ -124,9 +125,6 @@
 		autoUpdateEnabled: boolean;
 		autoUpdateCronExpression: string;
 		vulnerabilityCriteria: VulnerabilityCriteria;
-		// Compose stack info
-		isComposeContainer?: boolean;
-		composeStackName?: string;
 		// Config sets
 		configSets: ConfigSet[];
 		selectedConfigSetId: string;
@@ -152,6 +150,7 @@
 		restartMaxRetries = $bindable(),
 		networkMode = $bindable(),
 		startAfterCreate = $bindable(true),
+		repullImage = $bindable(true),
 		portMappings = $bindable(),
 		volumeMappings = $bindable(),
 		envVars = $bindable(),
@@ -190,8 +189,6 @@
 		autoUpdateEnabled = $bindable(),
 		autoUpdateCronExpression = $bindable(),
 		vulnerabilityCriteria = $bindable(),
-		isComposeContainer = false,
-		composeStackName = '',
 		configSets,
 		selectedConfigSetId = $bindable(),
 		errors = $bindable(),
@@ -644,6 +641,11 @@
 		</div>
 
 		<div class="flex items-center gap-3 pt-1">
+			<Label class="text-xs font-normal">Pull image before update</Label>
+			<TogglePill bind:checked={repullImage} />
+		</div>
+
+		<div class="flex items-center gap-3 pt-1">
 			<Label class="text-xs font-normal">Start container after {mode === 'create' ? 'creation' : 'update'}</Label>
 			<TogglePill bind:checked={startAfterCreate} />
 		</div>
@@ -710,7 +712,7 @@
 		<div class="flex justify-between items-center pb-2 border-b">
 			<h3 class="text-sm font-semibold text-foreground">Port mappings</h3>
 			<Button type="button" size="sm" variant="ghost" onclick={addPortMapping} class="h-7 text-xs">
-				<Plus class="w-3.5 h-3.5 mr-1" />
+				<Plus class="w-3.5 h-3.5" />
 				Add
 			</Button>
 		</div>
@@ -751,7 +753,7 @@
 		<div class="flex justify-between items-center pb-2 border-b">
 			<h3 class="text-sm font-semibold text-foreground">Volume mappings</h3>
 			<Button type="button" size="sm" variant="ghost" onclick={addVolumeMapping} class="h-7 text-xs">
-				<Plus class="w-3.5 h-3.5 mr-1" />
+				<Plus class="w-3.5 h-3.5" />
 				Add
 			</Button>
 		</div>
@@ -792,7 +794,7 @@
 		<div class="flex justify-between items-center pb-2 border-b">
 			<h3 class="text-sm font-semibold text-foreground">Environment variables</h3>
 			<Button type="button" size="sm" variant="ghost" onclick={addEnvVar} class="h-7 text-xs">
-				<Plus class="w-3.5 h-3.5 mr-1" />
+				<Plus class="w-3.5 h-3.5" />
 				Add
 			</Button>
 		</div>
@@ -828,7 +830,7 @@
 		<div class="flex justify-between items-center pb-2 border-b">
 			<h3 class="text-sm font-semibold text-foreground">Labels</h3>
 			<Button type="button" size="sm" variant="ghost" onclick={addLabel} class="h-7 text-xs">
-				<Plus class="w-3.5 h-3.5 mr-1" />
+				<Plus class="w-3.5 h-3.5" />
 				Add
 			</Button>
 		</div>
@@ -1230,7 +1232,7 @@
 			<div class="px-3 pb-3 space-y-3 border-t">
 				<div class="flex justify-end pt-2">
 					<Button type="button" size="sm" variant="ghost" onclick={addDeviceMapping} class="h-7 text-xs">
-						<Plus class="w-3.5 h-3.5 mr-1" />
+						<Plus class="w-3.5 h-3.5" />
 						Add device
 					</Button>
 				</div>
@@ -1417,7 +1419,7 @@
 			<div class="px-3 pb-3 space-y-3 border-t">
 				<div class="flex justify-end pt-2">
 					<Button type="button" size="sm" variant="ghost" onclick={addUlimit} class="h-7 text-xs">
-						<Plus class="w-3.5 h-3.5 mr-1" />
+						<Plus class="w-3.5 h-3.5" />
 						Add ulimit
 					</Button>
 				</div>
@@ -1461,8 +1463,6 @@
 			bind:cronExpression={autoUpdateCronExpression}
 			bind:vulnerabilityCriteria={vulnerabilityCriteria}
 			systemContainer={detectSystemContainer(image)}
-			{isComposeContainer}
-			{composeStackName}
 		/>
 	</div>
 </div>

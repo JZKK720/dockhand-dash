@@ -1,7 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { getEnvironment, updateEnvironment } from '$lib/server/db';
-import { getDockerInfo } from '$lib/server/docker';
+import { getDockerInfo, getHawserInfo } from '$lib/server/docker';
 import { edgeConnections, isEdgeConnected } from '$lib/server/hawser';
 
 export const POST: RequestHandler = async ({ params }) => {
@@ -70,37 +70,27 @@ export const POST: RequestHandler = async ({ params }) => {
 			}
 		}
 
-		const info = await getDockerInfo(env.id) as any;
-
-		// For Hawser Standard mode, fetch Hawser info (Edge mode handled above with early return)
+		// For Hawser Standard mode, fetch Docker info and Hawser info in parallel
+		// (sequential calls can fail due to Bun TLS connection reuse issues)
+		let info: any;
 		let hawserInfo = null;
 		if (env.connectionType === 'hawser-standard') {
-			// Standard mode: fetch via HTTP
-			try {
-				const protocol = env.useTls ? 'https' : 'http';
-				const headers: Record<string, string> = {};
-				if (env.hawserToken) {
-					headers['X-Hawser-Token'] = env.hawserToken;
-				}
-				const hawserResp = await fetch(`${protocol}://${env.host}:${env.port || 2376}/_hawser/info`, {
-					headers,
-					signal: AbortSignal.timeout(5000)
+			const [dockerResult, hawserResult] = await Promise.all([
+				getDockerInfo(env.id),
+				getHawserInfo(id)
+			]);
+			info = dockerResult;
+			hawserInfo = hawserResult;
+			if (hawserInfo?.hawserVersion) {
+				await updateEnvironment(id, {
+					hawserVersion: hawserInfo.hawserVersion,
+					hawserAgentId: hawserInfo.agentId,
+					hawserAgentName: hawserInfo.agentName,
+					hawserLastSeen: new Date().toISOString()
 				});
-				if (hawserResp.ok) {
-					hawserInfo = await hawserResp.json();
-					// Save hawser info to database
-					if (hawserInfo?.hawserVersion) {
-						await updateEnvironment(id, {
-							hawserVersion: hawserInfo.hawserVersion,
-							hawserAgentId: hawserInfo.agentId,
-							hawserAgentName: hawserInfo.agentName,
-							hawserLastSeen: new Date().toISOString()
-						});
-					}
-				}
-			} catch {
-				// Hawser info fetch failed, continue without it
 			}
+		} else {
+			info = await getDockerInfo(env.id);
 		}
 
 		return json({

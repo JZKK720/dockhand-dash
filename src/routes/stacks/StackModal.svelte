@@ -7,7 +7,7 @@
 	import CodeEditor, { type VariableMarker } from '$lib/components/CodeEditor.svelte';
 	import StackEnvVarsPanel from '$lib/components/StackEnvVarsPanel.svelte';
 	import { type EnvVar, type ValidationResult } from '$lib/components/StackEnvVarsEditor.svelte';
-	import { Layers, Save, Play, Code, GitGraph, Loader2, AlertCircle, X, Sun, Moon, TriangleAlert, GripVertical, FolderOpen, Copy, Check, MapPin, ArrowRight, ArrowDown, Info, Box, FolderSync } from 'lucide-svelte';
+	import { Layers, Save, Play, Code, GitGraph, Loader2, AlertCircle, X, Sun, Moon, TriangleAlert, GripVertical, FolderOpen, Copy, Check, XCircle, MapPin, ArrowRight, ArrowDown, Info, Box, FolderSync } from 'lucide-svelte';
 	import type { Component } from 'svelte';
 	import FilesystemBrowser from './FilesystemBrowser.svelte';
 	import PathBarItem from './PathBarItem.svelte';
@@ -17,6 +17,7 @@
 	import { currentEnvironment, appendEnvParam } from '$lib/stores/environment';
 	import { appSettings } from '$lib/stores/settings';
 	import { focusFirstInput } from '$lib/utils';
+	import { copyToClipboard } from '$lib/utils/clipboard';
 	import * as Alert from '$lib/components/ui/alert';
 	import { ErrorDialog } from '$lib/components/ui/error-dialog';
 	import ComposeGraphViewer from './ComposeGraphViewer.svelte';
@@ -89,8 +90,9 @@
 
 
 	// UI state
-	let composePathCopied = $state(false);
-	let envPathCopied = $state(false);
+	let composePathCopied = $state<'ok' | 'error' | null>(null);
+	let envPathCopied = $state<'ok' | 'error' | null>(null);
+	let composeContentCopied = $state<'ok' | 'error' | null>(null);
 	let needsFileLocation = $state(false);
 
 	// Container info for untracked stacks
@@ -283,7 +285,7 @@
 
 			if (!response.ok) {
 				const data = await response.json();
-				throw new Error(data.error || 'Failed to move files');
+				throw new Error((typeof data.error === 'string' ? data.error : data.message) || 'Failed to move files');
 			}
 
 			const result = await response.json();
@@ -325,11 +327,11 @@
 	}
 
 	// Generic copy function that returns a reset callback
-	function copyToClipboard(text: string | null, setCopied: (v: boolean) => void) {
+	async function copyText(text: string | null, setCopied: (v: 'ok' | 'error' | null) => void) {
 		if (text) {
-			navigator.clipboard.writeText(text);
-			setCopied(true);
-			setTimeout(() => setCopied(false), 2000);
+			const ok = await copyToClipboard(text);
+			setCopied(ok ? 'ok' : 'error');
+			setTimeout(() => setCopied(null), 2000);
 		}
 	}
 
@@ -765,7 +767,7 @@ services:
 					}
 					return;
 				}
-				throw new Error(data.error || 'Failed to load compose file');
+				throw new Error((typeof data.error === 'string' ? data.error : data.message) || 'Failed to load compose file');
 			}
 
 			composeContent = data.content;
@@ -930,7 +932,7 @@ services:
 
 			if (!response.ok) {
 				const data = await response.json();
-				throw new Error(data.error || 'Failed to create stack');
+				throw new Error((typeof data.error === 'string' ? data.error : data.message) || 'Failed to create stack');
 			}
 
 			onSuccess();
@@ -1037,22 +1039,7 @@ services:
 				requestBody.moveFromDir = moveFromDir;
 			}
 
-			// Save compose file (with optional paths)
-			const response = await fetch(
-				appendEnvParam(`/api/stacks/${encodeURIComponent(stackName)}/compose`, envId),
-				{
-					method: 'PUT',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify(requestBody)
-				}
-			);
-
-			const data = await response.json();
-
-			if (!response.ok) {
-				throw new Error(data.error || 'Failed to save compose file');
-			}
-
+			// Save env files BEFORE compose to ensure deploy reads fresh values
 			// Save raw content to .env file (non-secrets only, comments preserved)
 			const rawEnvResponse = await fetch(
 				appendEnvParam(`/api/stacks/${encodeURIComponent(stackName)}/env/raw`, envId),
@@ -1065,7 +1052,7 @@ services:
 
 			if (!rawEnvResponse.ok) {
 				const rawEnvError = await rawEnvResponse.json().catch(() => ({ error: 'Failed to save environment file' }));
-				throw new Error(rawEnvError.error || 'Failed to save environment file');
+				throw new Error((typeof rawEnvError.error === 'string' ? rawEnvError.error : rawEnvError.message) || 'Failed to save environment file');
 			}
 
 			// Save only secrets to DB (non-secrets are in the .env file written above)
@@ -1095,6 +1082,22 @@ services:
 				existingSecretKeys = new Set(
 					secretVars.filter(v => v.key.trim()).map(v => v.key.trim())
 				);
+			}
+
+			// Save compose file (with optional paths) - after env so deploy reads fresh .env
+			const response = await fetch(
+				appendEnvParam(`/api/stacks/${encodeURIComponent(stackName)}/compose`, envId),
+				{
+					method: 'PUT',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify(requestBody)
+				}
+			);
+
+			const data = await response.json();
+
+			if (!response.ok) {
+				throw new Error((typeof data.error === 'string' ? data.error : data.message) || 'Failed to save compose file');
 			}
 
 			isDirty = false; // Reset dirty flag after successful save
@@ -1461,7 +1464,7 @@ services:
 									path={workingComposePath || null}
 									placeholder="/path/to/compose.yaml"
 									copied={composePathCopied}
-									onCopy={() => copyToClipboard(workingComposePath, (v) => composePathCopied = v)}
+									onCopy={() => copyText(workingComposePath, (v) => composePathCopied = v)}
 									onBrowse={openComposeBrowser}
 									onChangeLocation={mode === 'edit' && !needsFileLocation ? openChangeLocationBrowser : undefined}
 									defaultText={mode === 'create' ? 'Enter stack name above' : 'Not specified'}
@@ -1478,7 +1481,7 @@ services:
 									selectedPath={workingEnvPath || suggestedEnvPath || ''}
 									placeholder="/path/to/.env (optional)"
 									copied={envPathCopied}
-									onCopy={() => copyToClipboard(displayEnvPath, (v) => envPathCopied = v)}
+									onCopy={() => copyText(displayEnvPath, (v) => envPathCopied = v)}
 									onBrowse={openEnvBrowser}
 									isEditable={true}
 									isCustom={!!workingEnvPath}
@@ -1506,7 +1509,7 @@ services:
 													Browse to locate the compose file for this stack. The editor will load the file contents once selected.
 												</p>
 												<Button variant="outline" size="sm" onclick={openComposeBrowser}>
-													<FolderOpen class="w-4 h-4 mr-2" />
+													<FolderOpen class="w-4 h-4" />
 													Browse for compose file
 												</Button>
 												<!-- Info box explaining what happens -->
@@ -1516,15 +1519,43 @@ services:
 												</div>
 											</div>
 										{:else}
-											<CodeEditor
-												bind:this={codeEditorRef}
-												value={composeContent}
-												language="yaml"
-												theme={editorTheme}
-												onchange={handleComposeChange}
-												variableMarkers={variableMarkers}
-												class="h-full rounded-md overflow-hidden border border-zinc-200 dark:border-zinc-700"
-											/>
+											<div class="h-full flex flex-col">
+												<!-- Copy button row -->
+												<div class="flex justify-end mb-1">
+													<Button
+														variant="ghost"
+														size="sm"
+														class="h-6 px-2 text-xs text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+														onclick={() => copyText(composeContent, (v) => composeContentCopied = v)}
+														disabled={!composeContent}
+													>
+														{#if composeContentCopied === 'error'}
+															<Tooltip.Root open>
+																<Tooltip.Trigger>
+																	<XCircle class="w-3 h-3 text-red-500" />
+																</Tooltip.Trigger>
+																<Tooltip.Content>Copy requires HTTPS</Tooltip.Content>
+															</Tooltip.Root>
+															Failed
+														{:else if composeContentCopied === 'ok'}
+															<Check class="w-3 h-3 text-green-500" />
+															Copied
+														{:else}
+															<Copy class="w-3 h-3" />
+															Copy
+														{/if}
+													</Button>
+												</div>
+												<CodeEditor
+													bind:this={codeEditorRef}
+													value={composeContent}
+													language="yaml"
+													theme={editorTheme}
+													onchange={handleComposeChange}
+													variableMarkers={variableMarkers}
+													class="flex-1 rounded-md overflow-hidden border border-zinc-200 dark:border-zinc-700"
+												/>
+											</div>
 										{/if}
 									</div>
 								{/if}
@@ -1587,19 +1618,19 @@ services:
 					<!-- Create mode buttons -->
 					<Button variant="outline" onclick={() => handleCreate(false)} disabled={saving}>
 						{#if saving}
-							<Loader2 class="w-4 h-4 mr-2 animate-spin" />
+							<Loader2 class="w-4 h-4 animate-spin" />
 							Creating...
 						{:else}
-							<Save class="w-4 h-4 mr-2" />
+							<Save class="w-4 h-4" />
 							Create
 						{/if}
 					</Button>
 					<Button onclick={() => handleCreate(true)} disabled={saving}>
 						{#if saving}
-							<Loader2 class="w-4 h-4 mr-2 animate-spin" />
+							<Loader2 class="w-4 h-4 animate-spin" />
 							Starting...
 						{:else}
-							<Play class="w-4 h-4 mr-2" />
+							<Play class="w-4 h-4" />
 							Create & Start
 						{/if}
 					</Button>
@@ -1607,19 +1638,19 @@ services:
 					<!-- Edit mode buttons -->
 					<Button variant="outline" class="w-24" onclick={() => handleSave(false)} disabled={saving || loading || (needsFileLocation && !workingComposePath.trim())}>
 						{#if saving && !savingWithRestart}
-							<Loader2 class="w-4 h-4 mr-2 animate-spin" />
+							<Loader2 class="w-4 h-4 animate-spin" />
 							Saving...
 						{:else}
-							<Save class="w-4 h-4 mr-2" />
+							<Save class="w-4 h-4" />
 							Save
 						{/if}
 					</Button>
 					<Button class="w-36" onclick={() => handleSave(true)} disabled={saving || loading || (needsFileLocation && !workingComposePath.trim())}>
 						{#if saving && savingWithRestart}
-							<Loader2 class="w-4 h-4 mr-2 animate-spin" />
+							<Loader2 class="w-4 h-4 animate-spin" />
 							Deploying...
 						{:else}
-							<Play class="w-4 h-4 mr-2" />
+							<Play class="w-4 h-4" />
 							Save & redeploy
 						{/if}
 					</Button>
@@ -1677,7 +1708,7 @@ services:
 				Leave files
 			</Button>
 			<Button variant="default" size="sm" onclick={confirmPathChangeAndMove}>
-				<ArrowRight class="w-3.5 h-3.5 mr-1" />
+				<ArrowRight class="w-3.5 h-3.5" />
 				Move files
 			</Button>
 		</div>
@@ -1754,10 +1785,10 @@ services:
 			</Button>
 			<Button variant="default" size="sm" onclick={confirmChangeLocation} disabled={movingLocation}>
 				{#if movingLocation}
-					<Loader2 class="w-3.5 h-3.5 mr-1.5 animate-spin" />
+					<Loader2 class="w-3.5 h-3.5 animate-spin" />
 					Moving...
 				{:else}
-					<FolderSync class="w-3.5 h-3.5 mr-1" />
+					<FolderSync class="w-3.5 h-3.5" />
 					Move files
 				{/if}
 			</Button>

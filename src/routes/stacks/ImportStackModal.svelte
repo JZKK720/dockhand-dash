@@ -182,7 +182,8 @@
 
 		try {
 			const parentDir = entry.path.replace(/\/[^/]+$/, '');
-			const stackName = parentDir.split('/').pop() || 'adopted-stack';
+			const rawName = parentDir.split('/').pop() || 'adopted-stack';
+			const stackName = rawName.toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'adopted-stack';
 			const envFilePath = `${parentDir}/.env`;
 
 			const stack: DiscoveredStack = {
@@ -411,7 +412,7 @@
 							<Loader2 class="w-4 h-4 mr-2 animate-spin" />
 							Adopting...
 						{:else}
-							<Import class="w-4 h-4 mr-2" />
+							<Import class="w-4 h-4" />
 							Adopt {selectedCount} stack(s)
 						{/if}
 					</Button>
@@ -488,7 +489,7 @@
 					<Loader2 class="w-4 h-4 mr-2 animate-spin" />
 					Adopting...
 				{:else}
-					<Import class="w-4 h-4 mr-2" />
+					<Import class="w-4 h-4" />
 					Adopt stack
 				{/if}
 			</Button>

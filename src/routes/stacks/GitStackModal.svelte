@@ -6,8 +6,9 @@
 	import { Label } from '$lib/components/ui/label';
 	import { Input } from '$lib/components/ui/input';
 	import { TogglePill } from '$lib/components/ui/toggle-pill';
-	import { Loader2, GitBranch, RefreshCw, Webhook, Rocket, RefreshCcw, Copy, Check, FolderGit2, Github, Key, KeyRound, Lock, FileText, HelpCircle, GripVertical, X, Download } from 'lucide-svelte';
+	import { Loader2, GitBranch, RefreshCw, Webhook, Rocket, RefreshCcw, Copy, Check, XCircle, FolderGit2, Github, Key, KeyRound, Lock, FileText, HelpCircle, GripVertical, X, Download } from 'lucide-svelte';
 	import * as Tooltip from '$lib/components/ui/tooltip';
+	import { copyToClipboard } from '$lib/utils/clipboard';
 	import CronEditor from '$lib/components/cron-editor.svelte';
 	import StackEnvVarsPanel from '$lib/components/StackEnvVarsPanel.svelte';
 	import { type EnvVar, type ValidationResult } from '$lib/components/StackEnvVarsEditor.svelte';
@@ -47,6 +48,7 @@
 		id: number;
 		stackName: string;
 		repositoryId: number;
+		environmentId: number | null;
 		composePath: string;
 		envFilePath: string | null;
 		autoUpdate: boolean;
@@ -91,8 +93,8 @@
 
 	// Stack name validation: must start with alphanumeric, can contain alphanumeric, hyphens, underscores
 	const STACK_NAME_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/;
-	let copiedWebhookUrl = $state(false);
-	let copiedWebhookSecret = $state(false);
+	let copiedWebhookUrl = $state<'ok' | 'error' | null>(null);
+	let copiedWebhookSecret = $state<'ok' | 'error' | null>(null);
 
 	// Environment variables state
 	let formEnvFilePath = $state<string | null>(null);
@@ -112,13 +114,17 @@
 
 	// Track which gitStack was initialized to avoid repeated resets
 	let lastInitializedStackId = $state<number | null | undefined>(undefined);
+	let isInitializing = $state(false);
 
 	$effect(() => {
 		if (open) {
 			const currentStackId = gitStack?.id ?? null;
-			if (lastInitializedStackId !== currentStackId) {
+			if (lastInitializedStackId !== currentStackId && !isInitializing) {
 				lastInitializedStackId = currentStackId;
-				resetForm();
+				isInitializing = true;
+				resetForm().finally(() => {
+					isInitializing = false;
+				});
 			}
 		} else {
 			lastInitializedStackId = undefined;
@@ -180,14 +186,15 @@
 		return `${window.location.origin}/api/git/stacks/${stackId}/webhook`;
 	}
 
-	async function copyToClipboard(text: string, type: 'url' | 'secret') {
-		await navigator.clipboard.writeText(text);
+	async function copyWebhookField(text: string, type: 'url' | 'secret') {
+		const ok = await copyToClipboard(text);
+		const state = ok ? 'ok' : 'error';
 		if (type === 'url') {
-			copiedWebhookUrl = true;
-			setTimeout(() => copiedWebhookUrl = false, 2000);
+			copiedWebhookUrl = state;
+			setTimeout(() => copiedWebhookUrl = null, 2000);
 		} else {
-			copiedWebhookSecret = true;
-			setTimeout(() => copiedWebhookSecret = false, 2000);
+			copiedWebhookSecret = state;
+			setTimeout(() => copiedWebhookSecret = null, 2000);
 		}
 	}
 
@@ -237,14 +244,18 @@
 		if (!gitStack) return;
 
 		try {
-			const response = await fetch(`/api/stacks/${encodeURIComponent(gitStack.stackName)}/env${environmentId ? `?env=${environmentId}` : ''}`);
+			// Use gitStack.environmentId when editing, fall back to prop for new stacks
+			const envIdToUse = gitStack.environmentId ?? environmentId;
+			const response = await fetch(`/api/stacks/${encodeURIComponent(gitStack.stackName)}/env${envIdToUse ? `?env=${envIdToUse}` : ''}`);
 			if (response.ok) {
 				const data = await response.json();
-				envVars = data.variables || [];
+				const loadedVars = data.variables || [];
 				// Track existing secret keys (secrets loaded from DB cannot have visibility toggled)
 				existingSecretKeys = new Set(
-					envVars.filter(v => v.isSecret && v.key.trim()).map(v => v.key.trim())
+					loadedVars.filter((v: EnvVar) => v.isSecret && v.key.trim()).map((v: EnvVar) => v.key.trim())
 				);
+				// Set envVars - the panel's $effect will auto-sync rawContent for text view
+				envVars = loadedVars;
 			}
 		} catch (e) {
 			console.error('Failed to load env var overrides:', e);
@@ -324,12 +335,12 @@
 		}
 	}
 
-	function resetForm() {
+	async function resetForm() {
 		// Clear state BEFORE async loads to avoid race conditions
 		formError = '';
 		errors = {};
-		copiedWebhookUrl = false;
-		copiedWebhookSecret = false;
+		copiedWebhookUrl = null;
+		copiedWebhookSecret = null;
 		envFiles = [];
 		envVars = [];
 		fileEnvVars = {};
@@ -346,12 +357,14 @@
 			formWebhookEnabled = gitStack.webhookEnabled;
 			formWebhookSecret = gitStack.webhookSecret || '';
 			formDeployNow = false;
-			// Load env files and overrides for editing (async - will populate envFiles, envVars, fileEnvVars)
-			loadEnvFiles();
-			loadEnvVarsOverrides();
-			if (gitStack.envFilePath) {
-				loadEnvFileContents(gitStack.envFilePath);
-			}
+
+			// Load env files and overrides SYNCHRONOUSLY to avoid race conditions
+			// Wait for all loads to complete before allowing any other effect to run
+			await Promise.all([
+				loadEnvFiles(),
+				loadEnvVarsOverrides(),
+				gitStack.envFilePath ? loadEnvFileContents(gitStack.envFilePath) : Promise.resolve()
+			]);
 		} else {
 			formRepoMode = repositories.length > 0 ? 'existing' : 'new';
 			formRepositoryId = null;
@@ -795,10 +808,17 @@
 								<Button
 									variant="outline"
 									size="sm"
-									onclick={() => copyToClipboard(getWebhookUrl(gitStack.id), 'url')}
+									onclick={() => copyWebhookField(getWebhookUrl(gitStack.id), 'url')}
 									title="Copy URL"
 								>
-									{#if copiedWebhookUrl}
+									{#if copiedWebhookUrl === 'error'}
+										<Tooltip.Root open>
+											<Tooltip.Trigger>
+												<XCircle class="w-4 h-4 text-red-500" />
+											</Tooltip.Trigger>
+											<Tooltip.Content>Copy requires HTTPS</Tooltip.Content>
+										</Tooltip.Root>
+									{:else if copiedWebhookUrl === 'ok'}
 										<Check class="w-4 h-4 text-green-500" />
 									{:else}
 										<Copy class="w-4 h-4" />
@@ -820,10 +840,17 @@
 								<Button
 									variant="outline"
 									size="sm"
-									onclick={() => copyToClipboard(formWebhookSecret, 'secret')}
+									onclick={() => copyWebhookField(formWebhookSecret, 'secret')}
 									title="Copy secret"
 								>
-									{#if copiedWebhookSecret}
+									{#if copiedWebhookSecret === 'error'}
+										<Tooltip.Root open>
+											<Tooltip.Trigger>
+												<XCircle class="w-4 h-4 text-red-500" />
+											</Tooltip.Trigger>
+											<Tooltip.Content>Copy requires HTTPS</Tooltip.Content>
+										</Tooltip.Root>
+									{:else if copiedWebhookSecret === 'ok'}
 										<Check class="w-4 h-4 text-green-500" />
 									{:else}
 										<Copy class="w-4 h-4" />
@@ -892,8 +919,9 @@
 				<StackEnvVarsPanel
 					bind:variables={envVars}
 					placeholder={{ key: 'MY_VAR', value: 'value' }}
-					infoText="Override variables from your repository env files. Non-secrets are saved to <code class='bg-muted px-1 rounded'>.env.dockhand</code> in the stack directory. Secrets are stored in the database and injected via shell environment at deploy time."
+					infoText="Override variables from your repository env files. Non-secrets are saved to <code class='bg-muted px-1 rounded'>.env.dockhand</code> in the stack directory. Secrets are stored in the database and injected via shell environment at deploy time.<br/><br/>Variables are available for <strong>compose file interpolation</strong> using <code class='bg-muted px-1 rounded'>${'{VAR_NAME}'}</code> syntax. They are not automatically injected into containers — use <code class='bg-muted px-1 rounded'>environment:</code> or reference <code class='bg-muted px-1 rounded'>.env.dockhand</code> in <code class='bg-muted px-1 rounded'>env_file:</code> to pass them through."
 					existingSecretKeys={gitStack !== null ? existingSecretKeys : new Set()}
+					showInterpolationHint={true}
 				>
 					{#snippet headerActions()}
 						{#if !gitStack}
@@ -910,7 +938,7 @@
 										<Loader2 class="w-3.5 h-3.5 mr-1 animate-spin" />
 										Loading...
 									{:else}
-										<Download class="w-3.5 h-3.5 mr-1" />
+										<Download class="w-3.5 h-3.5" />
 										Populate
 									{/if}
 								</Button>
@@ -939,7 +967,7 @@
 						<Loader2 class="w-4 h-4 mr-1 animate-spin" />
 						Deploying...
 					{:else}
-						<Rocket class="w-4 h-4 mr-1" />
+						<Rocket class="w-4 h-4" />
 						Save and deploy
 					{/if}
 				</Button>

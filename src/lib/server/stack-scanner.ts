@@ -44,7 +44,7 @@ export interface ScanResult {
 /**
  * Normalize a stack name to be valid (lowercase alphanumeric with hyphens/underscores)
  */
-function normalizeStackName(name: string): string {
+export function normalizeStackName(name: string): string {
 	return name
 		.toLowerCase()
 		.replace(/[^a-z0-9_-]/g, '-')
@@ -213,9 +213,9 @@ export async function adoptStack(
 	// Get all existing stack sources to check for duplicates
 	const existingSources = await getStackSources();
 
-	// Check if already adopted (by composePath)
+	// Check if already adopted (by composePath within the same environment)
 	const alreadyAdopted = existingSources.some(
-		(s) => s.composePath === stack.composePath
+		(s) => s.composePath === stack.composePath && s.environmentId === environmentId
 	);
 
 	if (alreadyAdopted) {
@@ -223,7 +223,7 @@ export async function adoptStack(
 	}
 
 	// Check for name conflict within the same environment
-	let finalName = stack.name;
+	let finalName = normalizeStackName(stack.name);
 	const existingNames = new Set(
 		existingSources
 			.filter((s) => s.environmentId === environmentId)

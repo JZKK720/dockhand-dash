@@ -22,7 +22,8 @@ import {
 	deleteStackEnvVars,
 	removePendingContainerUpdate,
 	deleteAutoUpdateSchedule,
-	getAutoUpdateSetting
+	getAutoUpdateSetting,
+	getStackSourceByComposePath
 } from './db';
 import { unregisterSchedule } from './scheduler';
 import { deleteGitStackFiles, parseEnvFileContent } from './git';
@@ -273,21 +274,31 @@ export async function getStackDir(stackName: string, envId?: number | null): Pro
 
 /**
  * Find stack directory, checking paths in order:
- * 1. New path (envName): $DATA_DIR/stacks/<envName>/<stackName>/
- * 2. ID-based path (envId): $DATA_DIR/stacks/<envId>/<stackName>/
- * 3. Legacy path: $DATA_DIR/stacks/<stackName>/
+ * 1. Database: Custom composePath in stackSources table (adopted/imported stacks)
+ * 2. New path (envName): $DATA_DIR/stacks/<envName>/<stackName>/
+ * 3. ID-based path (envId): $DATA_DIR/stacks/<envId>/<stackName>/
+ * 4. Legacy path: $DATA_DIR/stacks/<stackName>/
  *
  * Automatically looks up environment name from database.
  * Always checks legacy path for backwards compatibility with pre-env stacks.
  */
 export async function findStackDir(stackName: string, envId?: number | null): Promise<string | null> {
+	// 1. Check database for custom compose path first (adopted/imported stacks)
+	const source = await getStackSource(stackName, envId);
+	if (source?.composePath) {
+		const customDir = dirname(source.composePath);
+		if (existsSync(customDir)) {
+			return customDir;
+		}
+	}
+
 	const stacksDir = getStacksDir();
 
 	// Look up environment name if we have an ID
 	if (envId) {
 		const env = await getEnvironment(envId);
 
-		// 1. Check new path (with envName)
+		// 2. Check new path (with envName)
 		if (env) {
 			const namePath = join(stacksDir, env.name, stackName);
 			if (existsSync(namePath)) {
@@ -295,14 +306,14 @@ export async function findStackDir(stackName: string, envId?: number | null): Pr
 			}
 		}
 
-		// 2. Check ID-based path
+		// 3. Check ID-based path
 		const idPath = join(stacksDir, String(envId), stackName);
 		if (existsSync(idPath)) {
 			return idPath;
 		}
 	}
 
-	// 3. Always check legacy path (stacks created before env-scoping was added)
+	// 4. Always check legacy path (stacks created before env-scoping was added)
 	const legacyPath = join(stacksDir, stackName);
 	if (existsSync(legacyPath)) {
 		return legacyPath;
@@ -339,9 +350,15 @@ export interface GetComposeFileResult {
  */
 export async function getStackComposeFile(
 	stackName: string,
-	envId?: number | null
+	envId?: number | null,
+	composeConfigPath?: string
 ): Promise<GetComposeFileResult> {
-	const source = await getStackSource(stackName, envId);
+	let source = await getStackSource(stackName, envId);
+
+	// Fallback: try lookup by compose file path from Docker labels
+	if (!source && composeConfigPath) {
+		source = await getStackSourceByComposePath(composeConfigPath, envId);
+	}
 
 	// Case 1: Stack not in database = untracked (discovered from Docker but not imported)
 	// User must select the compose file location - don't guess from default location
@@ -742,6 +759,30 @@ interface ComposeCommandOptions {
 	envPath?: string;
 	/** When true, write non-secret envVars to .env.dockhand override file (git stacks only) */
 	useOverrideFile?: boolean;
+	/** Target specific service only (with --no-deps) for single-service updates */
+	serviceName?: string;
+	/** Compose filename for Hawser (e.g., "docker-compose.prod.yml") - extracted from composePath */
+	composeFileName?: string;
+}
+
+/**
+ * Find a Docker Compose override file alongside the main compose file.
+ * Docker Compose auto-discovers these when no -f flag is used, but when -f is required
+ * we need to explicitly include the override file.
+ */
+function findComposeOverrideFile(stackDir: string, composeFileName: string): string | null {
+	const overrideMap: Record<string, string[]> = {
+		'compose.yaml': ['compose.override.yaml', 'compose.override.yml'],
+		'compose.yml': ['compose.override.yaml', 'compose.override.yml'],
+		'docker-compose.yaml': ['docker-compose.override.yaml', 'docker-compose.override.yml'],
+		'docker-compose.yml': ['docker-compose.override.yaml', 'docker-compose.override.yml'],
+	};
+	const candidates = overrideMap[composeFileName] || [];
+	for (const name of candidates) {
+		const fullPath = join(stackDir, name);
+		if (existsSync(fullPath)) return fullPath;
+	}
+	return null;
 }
 
 /**
@@ -767,7 +808,8 @@ async function executeLocalCompose(
 	workingDir?: string,
 	customComposePath?: string,
 	customEnvPath?: string,
-	useOverrideFile?: boolean
+	useOverrideFile?: boolean,
+	serviceName?: string
 ): Promise<StackOperationResult> {
 	const logPrefix = `[Stack:${stackName}]`;
 
@@ -817,20 +859,34 @@ async function executeLocalCompose(
 		}
 	}
 
-	// Build spawn environment:
-	// 1. Start with process.env
-	// 2. Add DOCKER_HOST if specified
-	// 3. Add non-secret envVars (for backward compat when .env file doesn't exist)
-	// 4. Add secret envVars (CRITICAL: these are NEVER written to disk, only passed via shell env)
-	const spawnEnv: Record<string, string> = { ...(process.env as Record<string, string>) };
+	// Build spawn environment with ONLY essential system variables.
+	// CRITICAL: Do NOT spread process.env! Docker Compose shell env has higher
+	// priority than --env-file, so Dockhand's vars would override user's .env values.
+	const spawnEnv: Record<string, string> = {
+		PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+		HOME: process.env.HOME || '/root',
+	};
+
+	// Docker connection config
 	if (dockerHost) {
 		spawnEnv.DOCKER_HOST = dockerHost;
+	} else if (process.env.DOCKER_HOST) {
+		spawnEnv.DOCKER_HOST = process.env.DOCKER_HOST;
 	}
-	// Non-secret vars (backup for when .env file doesn't exist yet)
-	if (envVars) {
+
+	// Check if .env file exists on disk (for legacy support decision)
+	const defaultEnvPath = join(stackDir, '.env');
+	const hasEnvFile = existsSync(defaultEnvPath) || (customEnvPath && existsSync(customEnvPath));
+
+	// LEGACY SUPPORT: Only inject envVars via shell if NO .env file exists
+	// This is for stacks created with older Dockhand versions that stored env vars
+	// in DB but didn't write .env files to disk.
+	// For modern stacks with .env files, Docker Compose reads them via --env-file.
+	if (!hasEnvFile && envVars) {
 		Object.assign(spawnEnv, envVars);
 	}
-	// SECRET vars: injected via shell environment at runtime (NEVER written to .env file)
+
+	// SECRET vars: always injected via shell env (NEVER written to .env files)
 	if (secretVars) {
 		Object.assign(spawnEnv, secretVars);
 	}
@@ -874,10 +930,40 @@ async function executeLocalCompose(
 	// Build command based on operation
 	// If we have modified compose content (host path translation), use stdin instead of file
 	const useStdin = finalComposeContent !== composeContent;
-	const args = ['docker', 'compose', '-p', stackName, '-f', useStdin ? '-' : composeFile];
+	const args = ['docker', 'compose', '-p', stackName];
 
-	// Always auto-detect .env in compose directory
-	const defaultEnvPath = join(stackDir, '.env');
+	// Temp file for path-translated override content (cleaned up in finally block)
+	let tempOverridePath: string | undefined;
+
+	if (useStdin) {
+		// Host path translation: must pipe modified content via stdin
+		args.push('-f', '-');
+		// Also include override file if it exists (needs path translation too)
+		const overrideFile = findComposeOverrideFile(stackDir, basename(composeFile));
+		if (overrideFile) {
+			let overrideContent = await Bun.file(overrideFile).text();
+			if (getHostDataDir()) {
+				const rewrite = rewriteComposeVolumePaths(overrideContent, stackDir);
+				if (rewrite.modified) overrideContent = rewrite.content;
+			}
+			tempOverridePath = join(stackDir, '.compose.override.translated.yaml');
+			await Bun.write(tempOverridePath, overrideContent);
+			args.push('-f', tempOverridePath);
+			console.log(`${logPrefix} Including override file (path-translated): ${basename(overrideFile)}`);
+		}
+	} else if (customComposePath) {
+		// Custom path (imported/adopted stacks): must use -f to point to non-standard location
+		args.push('-f', composeFile);
+		const overrideFile = findComposeOverrideFile(stackDir, basename(composeFile));
+		if (overrideFile) {
+			args.push('-f', overrideFile);
+			console.log(`${logPrefix} Including override file: ${basename(overrideFile)}`);
+		}
+	}
+	// else: internal stack without path translation - no -f needed.
+	// Docker Compose auto-discovers compose.yaml + compose.override.yaml from cwd.
+
+	// Always auto-detect .env in compose directory (defaultEnvPath already defined above)
 	if (existsSync(defaultEnvPath)) {
 		args.push('--env-file', defaultEnvPath);
 	}
@@ -909,6 +995,10 @@ async function executeLocalCompose(
 		case 'up':
 			args.push('up', '-d', '--remove-orphans');
 			if (forceRecreate) args.push('--force-recreate');
+			// If targeting a specific service, only update that service
+			if (serviceName) {
+				args.push(serviceName);
+			}
 			break;
 		case 'down':
 			args.push('down');
@@ -925,6 +1015,10 @@ async function executeLocalCompose(
 			break;
 		case 'pull':
 			args.push('pull');
+			// If targeting a specific service, pull only that service
+			if (serviceName) {
+				args.push(serviceName);
+			}
 			break;
 	}
 
@@ -938,6 +1032,7 @@ async function executeLocalCompose(
 	console.log(`${logPrefix} DOCKER_HOST:`, dockerHost || '(local socket)');
 	console.log(`${logPrefix} Force recreate:`, forceRecreate ?? false);
 	console.log(`${logPrefix} Remove volumes:`, removeVolumes ?? false);
+	console.log(`${logPrefix} Service name:`, serviceName ?? '(all services)');
 	console.log(`${logPrefix} Env vars count:`, envVars ? Object.keys(envVars).length : 0);
 	if (envVars && Object.keys(envVars).length > 0) {
 		console.log(`${logPrefix} Env vars being injected (masked):`, JSON.stringify(maskSecrets(envVars), null, 2));
@@ -1034,6 +1129,15 @@ async function executeLocalCompose(
 			error: `Failed to run docker compose ${operation}: ${err.message}`
 		};
 	} finally {
+		// Cleanup temp override file from host path translation
+		if (tempOverridePath) {
+			try {
+				unlinkSync(tempOverridePath);
+			} catch {
+				// Ignore cleanup errors
+			}
+		}
+
 		// Cleanup TLS temp directory (always runs, even on exception)
 		if (tlsCertDir) {
 			activeTlsDirs.delete(tlsCertDir);
@@ -1062,7 +1166,9 @@ async function executeComposeViaHawser(
 	secretVars?: Record<string, string>,
 	forceRecreate?: boolean,
 	removeVolumes?: boolean,
-	stackFiles?: Record<string, string>
+	stackFiles?: Record<string, string>,
+	serviceName?: string,
+	composeFileName?: string
 ): Promise<StackOperationResult> {
 	const logPrefix = `[Stack:${stackName}]`;
 	// Import dockerFetch dynamically to avoid circular dependency
@@ -1080,6 +1186,8 @@ async function executeComposeViaHawser(
 	console.log(`${logPrefix} Environment ID:`, envId);
 	console.log(`${logPrefix} Force recreate:`, forceRecreate ?? false);
 	console.log(`${logPrefix} Remove volumes:`, removeVolumes ?? false);
+	console.log(`${logPrefix} Service name:`, serviceName ?? '(all services)');
+	console.log(`${logPrefix} Compose filename:`, composeFileName ?? '(auto-detect)');
 	console.log(`${logPrefix} Non-secret env vars count:`, envVars ? Object.keys(envVars).length : 0);
 	console.log(`${logPrefix} Secret env vars count:`, secretCount);
 	if (allEnvVars && Object.keys(allEnvVars).length > 0) {
@@ -1128,11 +1236,13 @@ async function executeComposeViaHawser(
 			operation,
 			projectName: stackName,
 			composeFile: composeContent,
+			composeFileName, // Explicit compose filename to use (e.g., "docker-compose.prod.yml")
 			envVars: allEnvVars, // All vars (including secrets) - Hawser injects via shell env
 			files, // Files including .env (secrets NOT in .env file)
 			forceRecreate: forceRecreate || false,
 			removeVolumes: removeVolumes || false,
-			registries // Registry credentials for docker login
+			registries, // Registry credentials for docker login
+			serviceName // Target specific service only (with --no-deps)
 		});
 
 		console.log(`${logPrefix} Sending request to Hawser agent...`);
@@ -1198,7 +1308,7 @@ async function executeComposeCommand(
 	envVars?: Record<string, string>,
 	secretVars?: Record<string, string>
 ): Promise<StackOperationResult> {
-	const { stackName, envId, forceRecreate, removeVolumes, stackFiles, workingDir, composePath, envPath, useOverrideFile } = options;
+	const { stackName, envId, forceRecreate, removeVolumes, stackFiles, workingDir, composePath, envPath, useOverrideFile, serviceName, composeFileName } = options;
 
 	// Get environment configuration
 	const env = envId ? await getEnvironment(envId) : null;
@@ -1219,7 +1329,8 @@ async function executeComposeCommand(
 			workingDir,
 			composePath,
 			envPath,
-			useOverrideFile
+			useOverrideFile,
+			serviceName
 		);
 	}
 
@@ -1242,6 +1353,24 @@ async function executeComposeCommand(
 					console.warn(`[Stack:${stackName}] Failed to read .env file at ${envPath}:`, err);
 				}
 			}
+
+			// Include compose override file if it exists alongside the compose file
+			let hawserStackFiles = stackFiles;
+			const composeDir = workingDir || (composePath ? dirname(composePath) : null);
+			const composeBaseName = composePath ? basename(composePath) : 'compose.yaml';
+			if (composeDir) {
+				const overridePath = findComposeOverrideFile(composeDir, composeBaseName);
+				if (overridePath) {
+					try {
+						const overrideContent = await Bun.file(overridePath).text();
+						hawserStackFiles = { ...(hawserStackFiles || {}), [basename(overridePath)]: overrideContent };
+						console.log(`[Stack:${stackName}] Including override file for Hawser: ${basename(overridePath)}`);
+					} catch (err) {
+						console.warn(`[Stack:${stackName}] Failed to read override file at ${overridePath}:`, err);
+					}
+				}
+			}
+
 			return executeComposeViaHawser(
 				operation,
 				stackName,
@@ -1251,7 +1380,9 @@ async function executeComposeCommand(
 				secretVars,
 				forceRecreate,
 				removeVolumes,
-				stackFiles
+				hawserStackFiles,
+				serviceName,
+				composeFileName
 			);
 		}
 
@@ -1281,7 +1412,8 @@ async function executeComposeCommand(
 				workingDir,
 				composePath,
 				envPath,
-				useOverrideFile
+				useOverrideFile,
+				serviceName
 			);
 		}
 
@@ -1301,7 +1433,8 @@ async function executeComposeCommand(
 				workingDir,
 				composePath,
 				envPath,
-				useOverrideFile
+				useOverrideFile,
+				serviceName
 			);
 	}
 }
@@ -1430,6 +1563,43 @@ export async function getStackPathHints(
 }
 
 /**
+ * Stop or remove orphan containers that belong to a stack but aren't defined in the compose file.
+ * These are dynamically-spawned child containers (e.g., nextcloud-aio master creates worker containers).
+ * Best-effort: errors are logged but don't fail the overall operation.
+ */
+async function cleanupOrphanStackContainers(
+	stackName: string,
+	envId: number | null | undefined,
+	operation: 'stop' | 'remove' | 'restart'
+): Promise<void> {
+	try {
+		const containers = await getStackContainers(stackName, envId);
+		const targets = containers.filter(
+			(c) => c.state === 'running' || c.state === 'restarting'
+		);
+		if (targets.length === 0) return;
+
+		const { stopContainer, removeContainer, restartContainer } = await import('./docker.js');
+		const results = await Promise.allSettled(
+			targets.map((c) => {
+				if (operation === 'remove') return removeContainer(c.id, true, envId);
+				if (operation === 'restart') return restartContainer(c.id, envId);
+				return stopContainer(c.id, envId);
+			})
+		);
+
+		const failures = results.filter((r) => r.status === 'rejected');
+		if (failures.length > 0) {
+			console.warn(
+				`[stacks] ${failures.length} orphan container(s) failed to ${operation} for stack "${stackName}"`
+			);
+		}
+	} catch (err) {
+		console.warn(`[stacks] Failed to cleanup orphan containers for stack "${stackName}":`, err);
+	}
+}
+
+/**
  * Helper to perform container-based operations for external stacks
  * Used as fallback when no compose file exists.
  * Uses Promise.allSettled for parallel execution.
@@ -1530,9 +1700,10 @@ export interface RequireComposeResult {
  */
 async function requireComposeFile(
 	stackName: string,
-	envId?: number | null
+	envId?: number | null,
+	composeConfigPath?: string
 ): Promise<RequireComposeResult> {
-	const composeResult = await getStackComposeFile(stackName, envId);
+	const composeResult = await getStackComposeFile(stackName, envId, composeConfigPath);
 
 	// If compose file not found, return info about what's needed
 	if (!composeResult.success) {
@@ -1633,13 +1804,18 @@ export async function stopStack(
 		return withContainerFallback(stackName, envId, 'stop');
 	}
 
-	return executeComposeCommand(
+	const composeResult = await executeComposeCommand(
 		'stop',
 		{ stackName, envId, workingDir: result.stackDir, composePath: result.composePath, envPath: result.envPath },
 		result.content!,
 		result.nonSecretVars,
 		result.secretVars
 	);
+
+	// Stop any dynamically-spawned child containers not in the compose file
+	await cleanupOrphanStackContainers(stackName, envId, 'stop');
+
+	return composeResult;
 }
 
 /**
@@ -1657,13 +1833,18 @@ export async function restartStack(
 		return withContainerFallback(stackName, envId, 'restart');
 	}
 
-	return executeComposeCommand(
+	const composeResult = await executeComposeCommand(
 		'restart',
 		{ stackName, envId, workingDir: result.stackDir, composePath: result.composePath, envPath: result.envPath },
 		result.content!,
 		result.nonSecretVars,
 		result.secretVars
 	);
+
+	// Restart any dynamically-spawned child containers not in the compose file
+	await cleanupOrphanStackContainers(stackName, envId, 'restart');
+
+	return composeResult;
 }
 
 /**
@@ -1682,13 +1863,18 @@ export async function downStack(
 		return withContainerFallback(stackName, envId, 'stop');
 	}
 
-	return executeComposeCommand(
+	const composeResult = await executeComposeCommand(
 		'down',
 		{ stackName, envId, removeVolumes, workingDir: result.stackDir, composePath: result.composePath, envPath: result.envPath },
 		result.content!,
 		result.nonSecretVars,
 		result.secretVars
 	);
+
+	// Remove any dynamically-spawned child containers not in the compose file
+	await cleanupOrphanStackContainers(stackName, envId, 'remove');
+
+	return composeResult;
 }
 
 /**
@@ -1727,6 +1913,9 @@ export async function removeStack(
 			if (!downResult.success && !force) {
 				return downResult;
 			}
+
+			// Remove any dynamically-spawned child containers not handled by compose
+			await cleanupOrphanStackContainers(stackName, envId, 'remove');
 		} else {
 			// External stack - remove containers directly in parallel
 			const { removeContainer } = await import('./docker.js');
@@ -1981,6 +2170,27 @@ export async function deployStack(options: DeployStackOptions): Promise<StackOpe
 				workingDir = await getStackDir(name, envId);
 				console.log(`${logPrefix} Using internal stack directory:`, workingDir);
 			}
+
+		}
+
+		// For Hawser deployments: include compose and .env in stackFiles
+		// Hawser writes files from the files map to disk at STACKS_DIR/{stackName}/
+		if (!stackFiles) {
+			stackFiles = {};
+		}
+		const composeFilename = actualComposePath ? basename(actualComposePath) : 'compose.yaml';
+		if (!stackFiles[composeFilename]) {
+			stackFiles[composeFilename] = compose;
+			console.log(`${logPrefix} Added ${composeFilename} to stackFiles for Hawser (${compose.length} chars)`);
+		}
+		if (actualEnvPath && existsSync(actualEnvPath) && !stackFiles['.env']) {
+			try {
+				const envContent = await Bun.file(actualEnvPath).text();
+				stackFiles['.env'] = envContent;
+				console.log(`${logPrefix} Added .env to stackFiles for Hawser (${envContent.length} chars)`);
+			} catch (err) {
+				console.warn(`${logPrefix} Failed to read .env file at ${actualEnvPath}:`, err);
+			}
 		}
 
 		console.log(`${logPrefix} Compose content length:`, compose.length, 'chars');
@@ -2011,7 +2221,9 @@ export async function deployStack(options: DeployStackOptions): Promise<StackOpe
 				workingDir,
 				composePath: actualComposePath,
 				envPath: actualEnvPath,
-				useOverrideFile: isGitStack
+				useOverrideFile: isGitStack,
+				// Pass compose filename for Hawser (extracted from path or provided explicitly)
+				composeFileName: composeFileName || (actualComposePath ? basename(actualComposePath) : undefined)
 			},
 			compose,
 			isGitStack ? dbNonSecretVars : undefined,
@@ -2050,6 +2262,93 @@ export async function pullStackImages(
 	return executeComposeCommand(
 		'pull',
 		{ stackName, envId, workingDir: result.stackDir, composePath: result.composePath, envPath: result.envPath },
+		result.content!,
+		result.nonSecretVars,
+		result.secretVars
+	);
+}
+
+/**
+ * Pull image for a specific service within a stack using docker compose pull <service>.
+ * This is the Compose-native approach to pulling images for auto-updates.
+ *
+ * @param stackName - The compose project name
+ * @param serviceName - The service name to pull
+ * @param envId - Optional environment ID
+ * @returns Operation result
+ */
+export async function pullStackService(
+	stackName: string,
+	serviceName: string,
+	envId?: number | null,
+	composeConfigPath?: string
+): Promise<StackOperationResult> {
+	const result = await requireComposeFile(stackName, envId, composeConfigPath);
+
+	if (!result.success) {
+		return {
+			success: false,
+			error: result.error || `Compose file not found for stack "${stackName}"`
+		};
+	}
+
+	return executeComposeCommand(
+		'pull',
+		{
+			stackName,
+			envId,
+			workingDir: result.stackDir,
+			composePath: result.composePath,
+			envPath: result.envPath,
+			serviceName
+		},
+		result.content!,
+		result.nonSecretVars,
+		result.secretVars
+	);
+}
+
+/**
+ * Update a specific service within a stack using docker compose up -d --no-deps.
+ * Docker Compose detects image changes naturally (the image is pulled beforehand),
+ * so --force-recreate is not needed and can cause permission issues on bind mounts.
+ * This preserves all compose configuration (static IPs, network aliases, etc.) while only
+ * recreating the specified service when its image has changed.
+ *
+ * @param stackName - The compose project name
+ * @param serviceName - The service name to update
+ * @param envId - Optional environment ID
+ * @returns Operation result
+ */
+export async function updateStackService(
+	stackName: string,
+	serviceName: string,
+	envId?: number | null,
+	composeConfigPath?: string
+): Promise<StackOperationResult> {
+	const result = await requireComposeFile(stackName, envId, composeConfigPath);
+
+	if (!result.success) {
+		return {
+			success: false,
+			error: result.error || `Compose file not found for stack "${stackName}"`
+		};
+	}
+
+	// Don't use forceRecreate - Docker Compose will detect the image change
+	// naturally since the image was already pulled before this function is called.
+	// Using forceRecreate can cause permission issues on bind mounts.
+	// This matches the behavior of: docker compose pull && docker compose up -d
+	return executeComposeCommand(
+		'up',
+		{
+			stackName,
+			envId,
+			workingDir: result.stackDir,
+			composePath: result.composePath,
+			envPath: result.envPath,
+			serviceName
+		},
 		result.content!,
 		result.nonSecretVars,
 		result.secretVars
@@ -2187,3 +2486,4 @@ export async function saveStackEnvVars(
 // They can be removed once all imports are updated
 
 export type { StackOperationResult as CreateStackResult };
+

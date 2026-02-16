@@ -4,7 +4,9 @@
 	import * as Tabs from '$lib/components/ui/tabs';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
-	import { Loader2, Box, Info, Layers, Cpu, MemoryStick, HardDrive, Network, Shield, Settings2, Code, Copy, Check, Activity, Wifi, Pencil, RefreshCw, X, FolderOpen, Moon, Tags, ExternalLink, Gpu } from 'lucide-svelte';
+	import { Loader2, Box, Info, Layers, Cpu, MemoryStick, HardDrive, Network, Shield, Settings2, Code, Copy, Check, XCircle, Activity, Wifi, Pencil, RefreshCw, X, FolderOpen, Moon, Tags, ExternalLink, Gpu } from 'lucide-svelte';
+	import * as Tooltip from '$lib/components/ui/tooltip';
+	import { copyToClipboard } from '$lib/utils/clipboard';
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
 	import { currentEnvironment, appendEnvParam, environments } from '$lib/stores/environment';
@@ -12,6 +14,7 @@
 	import LogsPanel from '../logs/LogsPanel.svelte';
 	import FileBrowserPanel from './FileBrowserPanel.svelte';
 	import { formatDateTime } from '$lib/stores/settings';
+	import { formatHostPortUrl } from '$lib/utils/url';
 
 	interface Props {
 		open: boolean;
@@ -40,18 +43,20 @@
 
 	// Raw JSON modal state
 	let showRawJson = $state(false);
-	let jsonCopied = $state(false);
+	let jsonCopied = $state<'ok' | 'error' | null>(null);
 
 	// Label copy state
 	let copiedLabel = $state<string | null>(null);
+	let copyLabelFailed = $state(false);
 
 	async function copyLabel(key: string, value: string) {
-		try {
-			await navigator.clipboard.writeText(`${key}=${value}`);
+		const ok = await copyToClipboard(`${key}=${value}`);
+		if (ok) {
 			copiedLabel = key;
 			setTimeout(() => copiedLabel = null, 2000);
-		} catch (err) {
-			console.error('Failed to copy:', err);
+		} else {
+			copyLabelFailed = true;
+			setTimeout(() => copyLabelFailed = false, 2000);
 		}
 	}
 
@@ -111,16 +116,16 @@
 		if (!env) return null;
 		// Priority 1: Use publicIp if configured
 		if (env.publicIp) {
-			return `http://${env.publicIp}:${publicPort}`;
+			return formatHostPortUrl(env.publicIp, publicPort);
 		}
 		// Priority 2: Extract from host for direct/hawser-standard
 		const connectionType = env.connectionType || 'socket';
 		if (connectionType === 'direct' && env.host) {
 			const host = extractHostFromUrl(env.host);
-			if (host) return `http://${host}:${publicPort}`;
+			if (host) return formatHostPortUrl(host, publicPort);
 		} else if (connectionType === 'hawser-standard' && env.host) {
 			const host = extractHostFromUrl(env.host);
-			if (host) return `http://${host}:${publicPort}`;
+			if (host) return formatHostPortUrl(host, publicPort);
 		}
 		// No public IP available for socket or hawser-edge
 		return null;
@@ -390,13 +395,9 @@
 
 	async function copyJson() {
 		if (containerData) {
-			try {
-				await navigator.clipboard.writeText(JSON.stringify(containerData, null, 2));
-				jsonCopied = true;
-				setTimeout(() => jsonCopied = false, 2000);
-			} catch (err) {
-				console.error('Failed to copy:', err);
-			}
+			const ok = await copyToClipboard(JSON.stringify(containerData, null, 2));
+			jsonCopied = ok ? 'ok' : 'error';
+			setTimeout(() => jsonCopied = null, 2000);
 		}
 	}
 
@@ -1266,40 +1267,80 @@
 
 					<!-- Health Tab -->
 					<Tabs.Content value="health" class="flex flex-col overflow-hidden">
-						{#if containerData.State?.Health}
-							<div class="flex flex-col flex-1 min-h-0 gap-3">
-								<div class="grid grid-cols-2 gap-3 text-sm shrink-0">
-									<div>
-										<p class="text-muted-foreground">Status</p>
-										<Badge variant={containerData.State.Health.Status === 'healthy' ? 'default' : 'destructive'}>
-											{containerData.State.Health.Status}
-										</Badge>
-									</div>
-									<div>
-										<p class="text-muted-foreground">Failing Streak</p>
-										<code class="text-xs">{containerData.State.Health.FailingStreak || 0}</code>
-									</div>
-								</div>
-
-								{#if containerData.State.Health.Log && containerData.State.Health.Log.length > 0}
-									<div class="flex flex-col flex-1 min-h-0">
-										<h3 class="text-sm font-semibold mb-2 shrink-0">Health check log</h3>
-										<div class="space-y-1 overflow-y-auto flex-1">
-											{#each containerData.State.Health.Log.slice(-5) as log}
-												<div class="p-2 border border-border rounded text-xs space-y-1">
-													<div class="flex justify-between items-center">
-														<Badge variant={log.ExitCode === 0 ? 'default' : 'destructive'} class="text-xs">
-															Exit: {log.ExitCode}
-														</Badge>
-														<span class="text-muted-foreground">{formatDate(log.End)}</span>
-													</div>
-													{#if log.Output}
-														<code class="block text-xs bg-muted p-1 rounded break-all">{log.Output.trim()}</code>
-													{/if}
-												</div>
-											{/each}
+						{@const healthConfig = containerData.Config?.Healthcheck}
+						{@const healthState = containerData.State?.Health}
+						{@const formatNs = (ns: number) => ns ? `${ns / 1e9}s` : '-'}
+						{#if healthConfig || healthState}
+							<div class="flex flex-col flex-1 min-h-0 gap-4">
+								<!-- Healthcheck Configuration -->
+								{#if healthConfig && healthConfig.Test && healthConfig.Test.length > 0}
+									<div class="shrink-0">
+										<h3 class="text-sm font-semibold mb-2">Configuration</h3>
+										<div class="grid grid-cols-2 gap-3 text-sm">
+											<div class="col-span-2">
+												<p class="text-muted-foreground">Command</p>
+												<code class="text-xs break-all">{healthConfig.Test.join(' ')}</code>
+											</div>
+											<div>
+												<p class="text-muted-foreground">Interval</p>
+												<code class="text-xs">{formatNs(healthConfig.Interval)}</code>
+											</div>
+											<div>
+												<p class="text-muted-foreground">Timeout</p>
+												<code class="text-xs">{formatNs(healthConfig.Timeout)}</code>
+											</div>
+											<div>
+												<p class="text-muted-foreground">Retries</p>
+												<code class="text-xs">{healthConfig.Retries || '-'}</code>
+											</div>
+											<div>
+												<p class="text-muted-foreground">Start period</p>
+												<code class="text-xs">{formatNs(healthConfig.StartPeriod)}</code>
+											</div>
 										</div>
 									</div>
+								{/if}
+
+								<!-- Runtime Status -->
+								{#if healthState}
+									<div class="shrink-0">
+										<h3 class="text-sm font-semibold mb-2">Status</h3>
+										<div class="grid grid-cols-2 gap-3 text-sm">
+											<div>
+												<p class="text-muted-foreground">Current status</p>
+												<Badge variant={healthState.Status === 'healthy' ? 'default' : healthState.Status === 'starting' ? 'secondary' : 'destructive'}>
+													{healthState.Status}
+												</Badge>
+											</div>
+											<div>
+												<p class="text-muted-foreground">Failing streak</p>
+												<code class="text-xs">{healthState.FailingStreak || 0}</code>
+											</div>
+										</div>
+									</div>
+
+									{#if healthState.Log && healthState.Log.length > 0}
+										<div class="flex flex-col flex-1 min-h-0">
+											<h3 class="text-sm font-semibold mb-2 shrink-0">Health check log</h3>
+											<div class="space-y-1 overflow-y-auto flex-1">
+												{#each healthState.Log.slice(-5) as log}
+													<div class="p-2 border border-border rounded text-xs space-y-1">
+														<div class="flex justify-between items-center">
+															<Badge variant={log.ExitCode === 0 ? 'default' : 'destructive'} class="text-xs">
+																Exit: {log.ExitCode}
+															</Badge>
+															<span class="text-muted-foreground">{formatDate(log.End)}</span>
+														</div>
+														{#if log.Output}
+															<code class="block text-xs bg-muted p-1 rounded break-all">{log.Output.trim()}</code>
+														{/if}
+													</div>
+												{/each}
+											</div>
+										</div>
+									{/if}
+								{:else if healthConfig}
+									<p class="text-sm text-muted-foreground">Waiting for first health check to complete...</p>
 								{/if}
 							</div>
 						{:else}
@@ -1327,9 +1368,17 @@
 					variant="outline"
 					size="sm"
 					onclick={copyJson}
-					title={jsonCopied ? 'Copied!' : 'Copy to clipboard'}
+					title={jsonCopied === 'ok' ? 'Copied!' : 'Copy to clipboard'}
 				>
-					{#if jsonCopied}
+					{#if jsonCopied === 'error'}
+						<Tooltip.Root open>
+							<Tooltip.Trigger>
+								<XCircle class="w-4 h-4 mr-1.5 text-red-500" />
+							</Tooltip.Trigger>
+							<Tooltip.Content>Copy requires HTTPS</Tooltip.Content>
+						</Tooltip.Root>
+						<span class="text-red-500">Failed</span>
+					{:else if jsonCopied === 'ok'}
 						<Check class="w-4 h-4 mr-1.5 text-green-500" />
 						<span class="text-green-500">Copied!</span>
 					{:else}

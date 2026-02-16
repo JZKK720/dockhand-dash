@@ -414,14 +414,15 @@
 							placeholder="gotify://hostname/app-token
 discord://webhook_id/webhook_token
 slack://token_a/token_b/token_c
+mmost://hostname/webhook-token
 tgram://bot_token/chat_id
 ntfy://my-topic
 pushover://user_key/api_token
 jsons://hostname/webhook/path"
-							class="flex min-h-[220px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-						></textarea>
-						<p class="text-xs text-muted-foreground">
-							Supports Gotify (gotify:// or gotifys:// for HTTPS), Discord, Slack, Telegram, ntfy, Pushover, and generic JSON webhooks.
+						class="flex min-h-[220px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+					></textarea>
+					<p class="text-xs text-muted-foreground">
+						Supports Gotify (gotify:// or gotifys:// for HTTPS), Discord, Slack, Mattermost (mmost:// or mmosts://), Telegram, ntfy, Pushover, and generic JSON webhooks.
 						</p>
 					</div>
 				</div>
@@ -481,7 +482,7 @@ jsons://hostname/webhook/path"
 					<XCircle class="w-4 h-4 mr-1 text-destructive" />
 					Failed
 				{:else}
-					<Send class="w-4 h-4 mr-1" />
+					<Send class="w-4 h-4" />
 					Test
 				{/if}
 			</Button>
@@ -491,9 +492,9 @@ jsons://hostname/webhook/path"
 					{#if formSaving}
 						<RefreshCw class="w-4 h-4 mr-1 animate-spin" />
 					{:else if isEditing}
-						<Check class="w-4 h-4 mr-1" />
+						<Check class="w-4 h-4" />
 					{:else}
-						<Plus class="w-4 h-4 mr-1" />
+						<Plus class="w-4 h-4" />
 					{/if}
 					{isEditing ? 'Save' : 'Add'}
 				</Button>
