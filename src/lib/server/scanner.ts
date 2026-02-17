@@ -238,8 +238,9 @@ function parseCliArgs(argsString: string, imageName: string): string[] {
 async function isScannerImageAvailable(scannerImage: string, envId?: number): Promise<boolean> {
 	try {
 		const images = await listImages(envId);
+		const imageWithTag = scannerImage.includes(':') ? scannerImage : `${scannerImage}:latest`;
 		return images.some((img) =>
-			img.tags?.some((tag: string) => tag.includes(scannerImage.split(':')[0]))
+			img.tags?.some((tag: string) => tag === imageWithTag)
 		);
 	} catch {
 		return false;
@@ -275,7 +276,7 @@ async function ensureScannerImage(
 
 // Extract JSON object from raw scanner output that may contain non-JSON content
 // (binary Docker stream headers, warning lines, control characters)
-function extractJson(output: string): string {
+export function extractJson(output: string): string {
 	const firstBrace = output.indexOf('{');
 	const lastBrace = output.lastIndexOf('}');
 	if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
@@ -289,7 +290,7 @@ function extractJson(output: string): string {
  * Some scanners (Grype) may include raw control chars (newlines, tabs, null bytes)
  * in vulnerability descriptions that aren't properly JSON-escaped.
  */
-function sanitizeJsonString(json: string): string {
+export function sanitizeJsonString(json: string): string {
 	// Replace unescaped control characters (0x00-0x1F) inside JSON string values
 	// by walking through the string and tracking whether we're inside a quoted string
 	let result = '';
@@ -301,7 +302,15 @@ function sanitizeJsonString(json: string): string {
 		const ch = json.charCodeAt(i);
 
 		if (escaped) {
-			result += json[i];
+			// Validate JSON escape sequences: only " \ / b f n r t u are valid
+			const ch2 = json[i];
+			if ('"\\\/bfnrtu'.includes(ch2)) {
+				result += ch2;
+			} else {
+				// Invalid escape like \x, \a, \0, \_ — convert backslash to literal \\
+				result += '\\' + ch2;
+				sanitized++;
+			}
 			escaped = false;
 			continue;
 		}
@@ -759,7 +768,7 @@ export async function scanWithGrype(
 
 		onProgress?.({
 			stage: 'complete',
-			message: 'Grype scan complete',
+			message: `Grype scan complete: ${summary.critical} critical, ${summary.high} high, ${summary.medium} medium, ${summary.low} low`,
 			scanner: 'grype',
 			progress: 100,
 			result
@@ -857,7 +866,7 @@ export async function scanWithTrivy(
 
 		onProgress?.({
 			stage: 'complete',
-			message: 'Trivy scan complete',
+			message: `Trivy scan complete: ${summary.critical} critical, ${summary.high} high, ${summary.medium} medium, ${summary.low} low`,
 			scanner: 'trivy',
 			progress: 100,
 			result
@@ -972,7 +981,7 @@ async function getScannerVersion(
 		// Check if image exists first
 		const images = await listImages(envId);
 		const hasImage = images.some((img) =>
-			img.tags?.some((tag: string) => tag.includes(scannerImage.split(':')[0]))
+			img.tags?.some((tag: string) => tag === scannerImage)
 		);
 		if (!hasImage) return null;
 

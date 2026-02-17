@@ -8,13 +8,15 @@
       { "type": "feature", "text": "Handle dynamically-spawned child containers in stack stop/down/restart/remove" },
       { "type": "feature", "text": "Git webhooks are logged to the audit log" },
       { "type": "feature", "text": "Add Mattermost notification support" },
+      { "type": "feature", "text": "Configurable disk usage warning threshold per environment" },
       { "type": "fix", "text": "Fix file upload CSRF 403 error on plain HTTP deployments" },
       { "type": "fix", "text": "Fix scanner container /wait timeout causing empty scan output" },
       { "type": "fix", "text": "Fix saving adopted external stack failing with 'Stack directory not found'" },
       { "type": "fix", "text": "Add Bearer token auth support for ntfy notifications" },
       { "type": "fix", "text": "Fix git SSH failing with 'No user exists for uid' with arbitrary UIDs" },
       { "type": "fix", "text": "Fix command palette flooding API requests on open" },
-      { "type": "fix", "text": "Normalize stack names when adopting to prevent uppercase rejection" }
+      { "type": "fix", "text": "Normalize stack names when adopting to prevent uppercase rejection" },
+      { "type": "fix", "text": "Fix container update failing for shared network modes (container:<name>, host, none)" }
     ],
     "imageTag": "fnsys/dockhand:v1.0.18"
   },
