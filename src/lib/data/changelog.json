@@ -1,7 +1,15 @@
 [
   {
+    "version": "1.0.20",
+    "date": "2026-03-02",
+    "changes": [
+      { "type": "fix", "text": "regression on Synology DSM" }
+    ],
+    "imageTag": "fnsys/dockhand:v1.0.20"
+  },
+  {
     "version": "1.0.19",
-    "comingSoon": true,
+    "date": "2026-03-01",
     "changes": [
       { "type": "feature", "text": "Inline logs panel on stacks page — view container logs without leaving the page" },
       { "type": "feature", "text": "Make ports column sortable in containers grid" },

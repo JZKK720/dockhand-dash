@@ -6,7 +6,7 @@ import { saveVulnerabilityScan, getEnvironment } from '$lib/server/db';
 import { authorize } from '$lib/server/authorize';
 import { auditImage } from '$lib/server/audit';
 import { sendEdgeStreamRequest, isEdgeConnected } from '$lib/server/hawser';
-import { createJob, appendLine, completeJob, failJob } from '$lib/server/jobs';
+import { createJobResponse } from '$lib/server/sse';
 
 /**
  * Check if environment is edge mode
@@ -74,78 +74,74 @@ export const POST: RequestHandler = async (event) => {
 	// Check if this is an edge environment
 	const edgeCheck = await isEdgeMode(envId);
 
-	// Job pattern: create job, run in background, return jobId immediately
-	const job = createJob();
+	return createJobResponse(async (send) => {
+		const sendData = (data: unknown) => {
+			send('progress', data);
+		};
 
-	const sendData = (data: unknown) => {
-		appendLine(job, { data });
-	};
+		/**
+		 * Handle scan-on-pull after image is pulled
+		 */
+		const handleScanOnPull = async () => {
+			if (skipScanOnPull) return;
 
-	/**
-	 * Handle scan-on-pull after image is pulled
-	 */
-	const handleScanOnPull = async () => {
-		if (skipScanOnPull) return;
+			const { scanner } = await getScannerSettings(envId);
+			if (scanner !== 'none') {
+				sendData({ status: 'scanning', message: 'Starting vulnerability scan...' });
 
-		const { scanner } = await getScannerSettings(envId);
-		if (scanner !== 'none') {
-			sendData({ status: 'scanning', message: 'Starting vulnerability scan...' });
+				try {
+					const results = await scanImage(image, envId, (progress) => {
+						sendData({ status: 'scan-progress', ...progress });
+					});
 
-			try {
-				const results = await scanImage(image, envId, (progress) => {
-					sendData({ status: 'scan-progress', ...progress });
-				});
+					for (const result of results) {
+						await saveVulnerabilityScan({
+							environmentId: envId ?? null,
+							imageId: result.imageId,
+							imageName: result.imageName,
+							scanner: result.scanner,
+							scannedAt: result.scannedAt,
+							scanDuration: result.scanDuration,
+							criticalCount: result.summary.critical,
+							highCount: result.summary.high,
+							mediumCount: result.summary.medium,
+							lowCount: result.summary.low,
+							negligibleCount: result.summary.negligible,
+							unknownCount: result.summary.unknown,
+							vulnerabilities: result.vulnerabilities,
+							error: result.error ?? null
+						});
+					}
 
-				for (const result of results) {
-					await saveVulnerabilityScan({
-						environmentId: envId ?? null,
-						imageId: result.imageId,
-						imageName: result.imageName,
-						scanner: result.scanner,
-						scannedAt: result.scannedAt,
-						scanDuration: result.scanDuration,
-						criticalCount: result.summary.critical,
-						highCount: result.summary.high,
-						mediumCount: result.summary.medium,
-						lowCount: result.summary.low,
-						negligibleCount: result.summary.negligible,
-						unknownCount: result.summary.unknown,
-						vulnerabilities: result.vulnerabilities,
-						error: result.error ?? null
+					const totalVulns = results.reduce((sum, r) => sum + r.vulnerabilities.length, 0);
+					sendData({
+						status: 'scan-complete',
+						message: `Scan complete - found ${totalVulns} vulnerabilities`,
+						results
+					});
+				} catch (scanError) {
+					console.error('Scan-on-pull failed:', scanError);
+					sendData({
+						status: 'scan-error',
+						error: scanError instanceof Error ? scanError.message : String(scanError)
 					});
 				}
-
-				const totalVulns = results.reduce((sum, r) => sum + r.vulnerabilities.length, 0);
-				sendData({
-					status: 'scan-complete',
-					message: `Scan complete - found ${totalVulns} vulnerabilities`,
-					results
-				});
-			} catch (scanError) {
-				console.error('Scan-on-pull failed:', scanError);
-				sendData({
-					status: 'scan-error',
-					error: scanError instanceof Error ? scanError.message : String(scanError)
-				});
 			}
-		}
-	};
+		};
 
-	// Run operation in background
-	(async () => {
 		console.log(`Starting pull for image: ${image}${edgeCheck.isEdge ? ' (edge mode)' : ''}`);
 
 		if (edgeCheck.isEdge && edgeCheck.environmentId) {
 			if (!isEdgeConnected(edgeCheck.environmentId)) {
 				sendData({ status: 'error', error: 'Edge agent not connected' });
-				failJob(job, 'Edge agent not connected');
-				return;
+				send('result', { status: 'error', error: 'Edge agent not connected' });
+				throw new Error('Edge agent not connected');
 			}
 
 			const pullUrl = buildPullUrl(image);
 			const authHeaders = await buildRegistryAuthHeader(image);
 
-			await new Promise<void>((resolve) => {
+			await new Promise<void>((resolve, reject) => {
 				const { cancel } = sendEdgeStreamRequest(
 					edgeCheck.environmentId!,
 					'POST',
@@ -173,14 +169,14 @@ export const POST: RequestHandler = async (event) => {
 						onEnd: async () => {
 							sendData({ status: 'complete' });
 							await handleScanOnPull();
-							completeJob(job, { status: 'complete' });
+							send('result', { status: 'complete' });
 							resolve();
 						},
 						onError: (error: string) => {
 							console.error('Edge pull error:', error);
 							sendData({ status: 'error', error });
-							failJob(job, error);
-							resolve();
+							send('result', { status: 'error', error });
+							reject(new Error(error));
 						}
 					},
 					undefined,
@@ -198,17 +194,14 @@ export const POST: RequestHandler = async (event) => {
 
 				sendData({ status: 'complete' });
 				await handleScanOnPull();
-				completeJob(job, { status: 'complete' });
+				send('result', { status: 'complete' });
 			} catch (error) {
 				console.error('Error pulling image:', error);
 				const errMsg = String(error);
 				sendData({ status: 'error', error: errMsg });
-				failJob(job, errMsg);
+				send('result', { status: 'error', error: errMsg });
+				throw error;
 			}
 		}
-	})().catch((err) => {
-		failJob(job, err instanceof Error ? err.message : String(err));
-	});
-
-	return json({ jobId: job.id });
+	}, request);
 };

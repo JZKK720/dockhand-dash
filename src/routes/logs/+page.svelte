@@ -432,6 +432,16 @@ import type { FavoriteGroup } from '../api/preferences/favorite-groups/+server';
 			const loggableContainers = allContainers.filter((c: ContainerInfo) =>
 				c.state === 'running' || c.state === 'exited'
 			);
+
+			// Before updating containers, capture current running set for grouped mode change detection
+			let prevRunningIds: string[] = [];
+			if (layoutMode === 'grouped' && selectedContainerIds.size > 0) {
+				prevRunningIds = Array.from(selectedContainerIds).filter(id => {
+					const container = containers.find(c => c.id === id);
+					return container?.state === 'running';
+				});
+			}
+
 			containers = loggableContainers;
 
 			// If selected container is no longer available, clear selection
@@ -439,6 +449,23 @@ import type { FavoriteGroup } from '../api/preferences/favorite-groups/+server';
 				selectedContainer = null;
 				logs = '';
 			}
+
+			// Grouped mode: restart stream if the running/stopped split changed
+			if (layoutMode === 'grouped' && selectedContainerIds.size > 0 && streamingEnabled) {
+				const newRunningIds = Array.from(selectedContainerIds).filter(id => {
+					const container = loggableContainers.find((c: ContainerInfo) => c.id === id);
+					return container?.state === 'running';
+				});
+
+				const runningSetChanged =
+					prevRunningIds.length !== newRunningIds.length ||
+					!prevRunningIds.every(id => newRunningIds.includes(id));
+
+				if (runningSetChanged) {
+					startGroupedStreaming();
+				}
+			}
+
 			return loggableContainers;
 		} catch (error) {
 			console.error('Failed to fetch containers:', error);

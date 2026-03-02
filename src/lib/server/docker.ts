@@ -14,6 +14,7 @@ import { createHash } from 'node:crypto';
 import type { Environment } from './db';
 import { getStackEnvVarsAsRecord } from './db';
 import { isSystemContainer } from './scheduler/tasks/update-utils';
+import { deepDiff } from '../utils/diff.js';
 
 /**
  * Custom error for when an environment is not found.
@@ -1664,42 +1665,6 @@ export async function createContainer(options: CreateContainerOptions, envId?: n
 	return { id: result.Id, start: () => startContainer(result.Id, envId) };
 }
 
-/**
- * Deep-diff two objects recursively, returning all paths that differ.
- */
-export function deepDiff(a: any, b: any, path = ''): string[] {
-	const diffs: string[] = [];
-
-	if (a === b) return diffs;
-	if (a === null || b === null || typeof a !== typeof b) {
-		diffs.push(`${path}: ${JSON.stringify(a)} → ${JSON.stringify(b)}`);
-		return diffs;
-	}
-	if (typeof a !== 'object') {
-		if (a !== b) diffs.push(`${path}: ${JSON.stringify(a)} → ${JSON.stringify(b)}`);
-		return diffs;
-	}
-	if (Array.isArray(a) || Array.isArray(b)) {
-		const aStr = JSON.stringify(a);
-		const bStr = JSON.stringify(b);
-		if (aStr !== bStr) diffs.push(`${path}: ${aStr} → ${bStr}`);
-		return diffs;
-	}
-
-	const allKeys = Array.from(new Set([...Object.keys(a), ...Object.keys(b)]));
-	for (const key of allKeys) {
-		const childPath = path ? `${path}.${key}` : key;
-		if (!(key in a)) {
-			diffs.push(`${childPath}: <missing> → ${JSON.stringify(b[key])}`);
-		} else if (!(key in b)) {
-			diffs.push(`${childPath}: ${JSON.stringify(a[key])} → <missing>`);
-		} else {
-			diffs.push(...deepDiff(a[key], b[key], childPath));
-		}
-	}
-
-	return diffs;
-}
 
 /**
  * Recreate a container using full Config/HostConfig passthrough from inspect data.

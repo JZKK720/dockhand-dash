@@ -2,7 +2,7 @@ import { json, type RequestHandler } from '@sveltejs/kit';
 import { scanImage, type ScanProgress, type ScanResult } from '$lib/server/scanner';
 import { saveVulnerabilityScan, getLatestScanForImage } from '$lib/server/db';
 import { authorize } from '$lib/server/authorize';
-import { createJob, appendLine, completeJob, failJob } from '$lib/server/jobs';
+import { createJobResponse } from '$lib/server/sse';
 
 // Helper to convert ScanResult to database format
 function scanResultToDbFormat(result: ScanResult, envId?: number) {
@@ -24,7 +24,7 @@ function scanResultToDbFormat(result: ScanResult, envId?: number) {
 	};
 }
 
-// POST - Start a scan (returns { jobId } for progress polling)
+// POST - Start a scan (returns { jobId } for progress polling, or synchronous JSON for Accept: application/json)
 export const POST: RequestHandler = async ({ request, url, cookies }) => {
 	const auth = await authorize(cookies);
 
@@ -43,14 +43,11 @@ export const POST: RequestHandler = async ({ request, url, cookies }) => {
 		return json({ error: 'Image name is required' }, { status: 400 });
 	}
 
-	// Job pattern: create job, run in background, return jobId immediately
-	const job = createJob();
+	return createJobResponse(async (send) => {
+		const sendProgress = (progress: ScanProgress) => {
+			send('progress', progress);
+		};
 
-	const sendProgress = (progress: ScanProgress) => {
-		appendLine(job, { data: progress });
-	};
-
-	(async () => {
 		try {
 			const results = await scanImage(imageName, envId, sendProgress, forceScannerType);
 
@@ -67,8 +64,7 @@ export const POST: RequestHandler = async ({ request, url, cookies }) => {
 				result: results[0],
 				results: results // Include all scanner results
 			};
-			sendProgress(completeProgress);
-			completeJob(job, completeProgress);
+			send('result', completeProgress);
 		} catch (error) {
 			const errorMsg = error instanceof Error ? error.message : String(error);
 			const errorProgress: ScanProgress = {
@@ -76,14 +72,10 @@ export const POST: RequestHandler = async ({ request, url, cookies }) => {
 				message: `Scan failed: ${errorMsg}`,
 				error: errorMsg
 			};
-			sendProgress(errorProgress);
-			failJob(job, errorMsg);
+			send('result', errorProgress);
+			throw error;
 		}
-	})().catch((err) => {
-		failJob(job, err instanceof Error ? err.message : String(err));
-	});
-
-	return json({ jobId: job.id });
+	}, request);
 };
 
 // GET - Get cached scan results for an image

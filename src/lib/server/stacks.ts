@@ -138,6 +138,10 @@ const stackLocks = new Map<string, Promise<void>>();
 // Track active TLS temp directories for cleanup on unexpected process exit
 const activeTlsDirs = new Set<string>();
 
+// Cache of envId → daemon max API version (e.g. "1.43")
+// Populated lazily to avoid CLI/daemon version mismatch on older Docker hosts (e.g. Synology)
+const dockerApiVersionCache = new Map<string, string>();
+
 // Register cleanup handlers once at module load
 if (typeof process !== 'undefined') {
 	const cleanupTlsDirs = () => {
@@ -151,6 +155,25 @@ if (typeof process !== 'undefined') {
 	process.on('exit', cleanupTlsDirs);
 	process.on('SIGINT', () => { cleanupTlsDirs(); process.exit(130); });
 	process.on('SIGTERM', () => { cleanupTlsDirs(); process.exit(143); });
+}
+
+/**
+ * Fetch and cache the Docker daemon's maximum supported API version for a given environment.
+ * Used to set DOCKER_API_VERSION when spawning docker compose, preventing version mismatch
+ * errors on older Docker hosts (e.g. Synology DSM).
+ */
+async function getDockerApiVersionForCli(envId: number | null | undefined): Promise<string | undefined> {
+	const key = String(envId ?? 'local');
+	if (dockerApiVersionCache.has(key)) return dockerApiVersionCache.get(key);
+	try {
+		const { getDockerVersion } = await import('./docker.js');
+		const version = await getDockerVersion(envId);
+		const apiVersion: string | undefined = version?.ApiVersion;
+		if (apiVersion) dockerApiVersionCache.set(key, apiVersion);
+		return apiVersion;
+	} catch {
+		return undefined;
+	}
 }
 
 /**
@@ -907,6 +930,15 @@ async function executeLocalCompose(
 		spawnEnv.DOCKER_HOST = dockerHost;
 	} else if (process.env.DOCKER_HOST) {
 		spawnEnv.DOCKER_HOST = process.env.DOCKER_HOST;
+	}
+
+	// Auto-cap Docker CLI API version to the daemon's max supported version.
+	// This fixes compatibility with older Docker daemons (e.g. Synology DSM) that
+	// reject newer client versions. DOCKER_API_VERSION env var overrides this if set.
+	const daemonApiVersion = process.env.DOCKER_API_VERSION
+		?? await getDockerApiVersionForCli(envId);
+	if (daemonApiVersion) {
+		spawnEnv.DOCKER_API_VERSION = daemonApiVersion;
 	}
 
 	// Check if .env file exists on disk (for legacy support decision)
