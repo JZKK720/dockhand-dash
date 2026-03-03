@@ -2616,6 +2616,9 @@ async function getRegistryBearerToken(registry: string, repo: string): Promise<s
 			return null;
 		}
 
+		// Drain 401 response body before bearer token fetch (required by Node.js/Undici for connection reuse)
+		await drainResponse(challengeResponse);
+
 		// Parse bearer challenge: Bearer realm="...",service="...",scope="..."
 		const realmMatch = wwwAuth.match(/realm="([^"]+)"/i);
 		const serviceMatch = wwwAuth.match(/service="([^"]+)"/i);
@@ -2659,7 +2662,9 @@ async function getRegistryBearerToken(registry: string, repo: string): Promise<s
 
 	} catch (e) {
 		const errorMsg = e instanceof Error ? e.message : String(e);
-		console.error('[Registry] Failed to get bearer token:', errorMsg);
+		const cause = (e as any)?.cause;
+		const causeMsg = cause ? ` (cause: ${cause})` : '';
+		console.error('[Registry] Failed to get bearer token:', errorMsg + causeMsg);
 		return null;
 	}
 }
@@ -2725,6 +2730,9 @@ export async function getRegistryAuthHeader(
 			return null;
 		}
 
+		// Drain 401 response body before bearer token fetch (required by Node.js/Undici for connection reuse)
+		await drainResponse(challengeResponse);
+
 		// Parse bearer challenge: Bearer realm="...",service="...",scope="..."
 		const realmMatch = wwwAuth.match(/realm="([^"]+)"/i);
 		const serviceMatch = wwwAuth.match(/service="([^"]+)"/i);
@@ -2767,7 +2775,9 @@ export async function getRegistryAuthHeader(
 
 	} catch (e) {
 		const errorMsg = e instanceof Error ? e.message : String(e);
-		console.error('[Registry] Failed to get auth header:', errorMsg);
+		const cause = (e as any)?.cause;
+		const causeMsg = cause ? ` (cause: ${cause})` : '';
+		console.error('[Registry] Failed to get auth header:', errorMsg + causeMsg);
 		return null;
 	}
 }
