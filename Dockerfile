@@ -23,7 +23,7 @@ RUN apk add --no-cache curl unzip \
        | tar -xz --strip-components=1 -C /usr/local/bin \
     && chmod +x /usr/local/bin/apko
 
-# Generate apko.yaml — Node.js instead of Bun
+# Generate apko.yaml — Node.js binary comes from node:24-slim, not Wolfi
 RUN APKO_ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "aarch64" || echo "x86_64") \
     && printf '%s\n' \
     "contents:" \
@@ -36,7 +36,6 @@ RUN APKO_ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "aarch64" || echo "x86_64") 
     "    - ca-certificates" \
     "    - busybox" \
     "    - tzdata" \
-    "    - nodejs-24" \
     "    - docker-cli" \
     "    - docker-compose" \
     "    - docker-cli-buildx" \
@@ -66,7 +65,7 @@ RUN apko build apko.yaml dockhand-base:latest output.tar \
 # -----------------------------------------------------------------------------
 # Stage 2: Application Builder (pure Node.js)
 # -----------------------------------------------------------------------------
-FROM node:24-slim AS app-builder
+FROM --platform=$TARGETPLATFORM node:24-slim AS app-builder
 
 WORKDIR /app
 
@@ -103,6 +102,10 @@ FROM scratch
 
 # Install custom Wolfi OS with Node.js
 COPY --from=os-builder /work/rootfs/ /
+
+# Copy Node.js binary from official node:24-slim (platform-correct, conservative CPU baseline)
+# Wolfi's nodejs-24 targets ARMv8.1+ which causes SIGILL on Cortex-A53 (Raspberry Pi 3+)
+COPY --from=app-builder /usr/local/bin/node /usr/local/bin/node
 
 # Copy libnss_wrapper for git SSH with arbitrary UIDs
 COPY --from=app-builder /usr/local/lib/libnss_wrapper.so /usr/lib/libnss_wrapper.so

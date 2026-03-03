@@ -588,46 +588,37 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 				}
 			};
 
-			// Continuously process all sources
-			console.log('[merged-logs] Starting processing loop');
-			let loopCount = 0;
-			while (!controllerClosed) {
-				const activeSources = sources.filter(s => !s.done && s.reader);
-				if (activeSources.length === 0) {
+			// Each source streams independently — no lockstep polling
+			console.log(`[merged-logs] Starting ${sources.length} independent read loops`);
+
+			let endedCount = 0;
+			const checkAllDone = () => {
+				endedCount++;
+				if (endedCount >= sources.length) {
 					safeEnqueue(`event: end\ndata: ${JSON.stringify({ reason: 'all streams ended' })}\n\n`);
-					break;
-				}
-
-				if (loopCount === 0) {
-					console.log(`[merged-logs] Processing ${activeSources.length} active sources, first read...`);
-				}
-				loopCount++;
-
-				await Promise.all(activeSources.map(processSource));
-
-				// Small delay to prevent tight loop
-				await new Promise(resolve => setTimeout(resolve, 10));
-			}
-
-			// Cleanup readers
-			for (const source of sources) {
-				if (source.reader) {
-					try {
-						await source.reader.cancel().catch(() => {});
-					source.reader.releaseLock();
-					} catch {
-						// Ignore
+					if (!controllerClosed) {
+						try { controller.close(); } catch { /* Already closed */ }
 					}
 				}
-			}
+			};
 
-			if (!controllerClosed) {
+			const runSource = async (source: ContainerLogSource) => {
 				try {
-					controller.close();
-				} catch {
-					// Already closed
+					while (!controllerClosed && !source.done) {
+						await processSource(source);
+					}
+				} finally {
+					if (source.reader) {
+						try {
+							await source.reader.cancel().catch(() => {});
+							source.reader.releaseLock();
+						} catch { /* Ignore */ }
+					}
+					checkAllDone();
 				}
-			}
+			};
+
+			await Promise.all(sources.map(runSource));
 		},
 		cancel() {
 			controllerClosed = true;

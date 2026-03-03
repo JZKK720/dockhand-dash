@@ -414,6 +414,11 @@ function cleanupRecentEvents(): void {
 async function sendEnvironmentConfigs(): Promise<void> {
 	const environments = await getEnvironments();
 	const activeIds = new Set<number>();
+	const lines: string[] = [];
+
+	const enqueue = (msg: Record<string, unknown>) => {
+		lines.push(JSON.stringify(msg));
+	};
 
 	for (const env of environments) {
 		// Skip hawser-edge (events come via WebSocket)
@@ -446,7 +451,7 @@ async function sendEnvironmentConfigs(): Promise<void> {
 		// Only send if env has metrics or activity collection enabled
 		if (env.collectMetrics === false && env.collectActivity === false) continue;
 
-		sendToGo({
+		enqueue({
 			type: 'configure',
 			envId: env.id,
 			name: env.name,
@@ -461,7 +466,7 @@ async function sendEnvironmentConfigs(): Promise<void> {
 	// Remove envs that are no longer active
 	for (const envId of configuredEnvs) {
 		if (!activeIds.has(envId)) {
-			sendToGo({ type: 'remove', envId });
+			enqueue({ type: 'remove', envId });
 			configuredEnvs.delete(envId);
 			envNames.delete(envId);
 		}
@@ -469,11 +474,18 @@ async function sendEnvironmentConfigs(): Promise<void> {
 
 	// Send settings
 	const metricsInterval = await getMetricsCollectionInterval();
-	sendToGo({ type: 'set_metrics_interval', intervalMs: metricsInterval });
+	enqueue({ type: 'set_metrics_interval', intervalMs: metricsInterval });
 
 	const eventMode = await getEventCollectionMode();
 	const pollInterval = await getEventPollInterval();
-	sendToGo({ type: 'set_event_mode', mode: eventMode, pollIntervalMs: pollInterval });
+	enqueue({ type: 'set_event_mode', mode: eventMode, pollIntervalMs: pollInterval });
+
+	// Single atomic write — avoids pipe backpressure on low-memory ARM devices
+	// where multiple rapid writes can overflow small OS pipe buffers (4-16KB on
+	// some ARM Linux configs) before Go has drained them.
+	if (lines.length > 0 && proc?.stdin?.writable) {
+		proc.stdin.write(lines.join('\n') + '\n');
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +554,16 @@ export async function startSubprocesses(): Promise<void> {
 
 	proc = spawn(workerPath, [], {
 		stdio: ['pipe', 'pipe', 'inherit']
+	});
+
+	// Prevent unhandled 'error' events on stdin from destroying the pipe.
+	// Without this, any write error (e.g. EPIPE on a momentarily full pipe buffer
+	// on low-memory systems) destroys the stream, sending EOF to Go and causing
+	// it to exit — which looks like a mysterious restart loop on Raspberry Pi.
+	proc.stdin?.on('error', (err: NodeJS.ErrnoException) => {
+		if (!isShuttingDown) {
+			console.error('[SubprocessManager] stdin pipe error:', err.message);
+		}
 	});
 
 	// Start reading stdout
