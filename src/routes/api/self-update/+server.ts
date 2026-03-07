@@ -1,22 +1,22 @@
 import { json } from '@sveltejs/kit';
 import { authorize } from '$lib/server/authorize';
 import { getOwnContainerId, getHostDockerSocket } from '$lib/server/host-path';
+import { buildRegistryAuthHeader, unixSocketRequest, unixSocketStreamRequest } from '$lib/server/docker';
 import type { RequestHandler } from './$types';
+import { prefersJSON, sseToJSON } from '$lib/server/sse';
 
 const UPDATER_IMAGE = 'fnsys/dockhand-updater:latest';
 const UPDATER_LABEL = 'dockhand.updater';
+const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
 
-/**
- * Fetch from the local Docker socket directly.
- * Self-update always operates on the local engine — no environment routing needed.
- */
-async function localDockerFetch(path: string, options: RequestInit = {}): Promise<Response> {
-	const socketPath = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
-	return fetch(`http://localhost${path}`, {
-		...options,
-		// @ts-ignore - Bun supports unix sockets
-		unix: socketPath
-	});
+/** Fetch from the local Docker socket (buffered). */
+function localDockerFetch(path: string, options: RequestInit = {}): Promise<Response> {
+	return unixSocketRequest(DOCKER_SOCKET, path, options);
+}
+
+/** Fetch from the local Docker socket (streaming body for pull progress). */
+function localDockerStreamFetch(path: string, options: RequestInit = {}): Promise<Response> {
+	return unixSocketStreamRequest(DOCKER_SOCKET, path, options);
 }
 
 /**
@@ -34,9 +34,10 @@ async function pullImageLocal(imageName: string, onProgress?: (line: string) => 
 		}
 	}
 
-	const response = await localDockerFetch(
+	const authHeaders = await buildRegistryAuthHeader(imageName);
+	const response = await localDockerStreamFetch(
 		`/images/create?fromImage=${encodeURIComponent(fromImage)}&tag=${encodeURIComponent(tag)}`,
-		{ method: 'POST' }
+		{ method: 'POST', headers: authHeaders }
 	);
 
 	if (!response.ok) {
@@ -128,6 +129,12 @@ function buildCreateConfig(inspectData: any, newImage: string): any {
 
 	// Clear MacAddress for Docker API < 1.44 compatibility
 	delete createConfig.MacAddress;
+
+	// Clear Entrypoint and Cmd so the new image's defaults are used.
+	// This prevents carrying over a stale entrypoint from a previous runtime
+	// (e.g. Bun's docker-entrypoint.sh → Node.js docker-entrypoint-node.sh).
+	delete createConfig.Entrypoint;
+	delete createConfig.Cmd;
 
 	// Clear Hostname so Docker assigns the new container's own ID
 	// Otherwise the old container's hostname is inherited, breaking self-identification
@@ -400,11 +407,14 @@ export const POST: RequestHandler = async ({ request, cookies }) => {
 		}
 	});
 
-	return new Response(stream, {
+	const sseResponse = new Response(stream, {
 		headers: {
 			'Content-Type': 'text/event-stream',
 			'Cache-Control': 'no-cache',
-			'Connection': 'keep-alive'
+			'Connection': 'keep-alive',
+			'X-Accel-Buffering': 'no'
 		}
 	});
+	if (prefersJSON(request)) return sseToJSON(sseResponse);
+	return sseResponse;
 };

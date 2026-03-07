@@ -3,10 +3,13 @@
  *
  * Provides compose-first stack operations for internal, git, and external stacks.
  * All lifecycle operations use docker compose commands.
+ * v1.0.20
  */
 
 import { existsSync, mkdirSync, rmSync, readdirSync, cpSync, statSync, unlinkSync, renameSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve, dirname, basename } from 'node:path';
+import { spawn as nodeSpawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import {
 	getEnvironment,
 	getSecretEnvVarsAsRecord,
@@ -136,6 +139,10 @@ const stackLocks = new Map<string, Promise<void>>();
 // Track active TLS temp directories for cleanup on unexpected process exit
 const activeTlsDirs = new Set<string>();
 
+// Cache of envId → daemon max API version (e.g. "1.43")
+// Populated lazily to avoid CLI/daemon version mismatch on older Docker hosts (e.g. Synology)
+const dockerApiVersionCache = new Map<string, string>();
+
 // Register cleanup handlers once at module load
 if (typeof process !== 'undefined') {
 	const cleanupTlsDirs = () => {
@@ -149,6 +156,85 @@ if (typeof process !== 'undefined') {
 	process.on('exit', cleanupTlsDirs);
 	process.on('SIGINT', () => { cleanupTlsDirs(); process.exit(130); });
 	process.on('SIGTERM', () => { cleanupTlsDirs(); process.exit(143); });
+}
+
+/**
+ * Fetch and cache the Docker daemon's maximum supported API version for a given environment.
+ * Used to set DOCKER_API_VERSION when spawning docker compose, preventing version mismatch
+ * errors on older Docker hosts (e.g. Synology DSM).
+ *
+ * Strategy:
+ * 1. Try Dockhand's HTTP API call to the daemon (works for all environment types)
+ * 2. Fall back to `docker version` CLI command (works for local socket connections)
+ */
+async function getDockerApiVersionForCli(envId: number | null | undefined): Promise<string | undefined> {
+	const key = String(envId ?? 'local');
+	if (dockerApiVersionCache.has(key)) return dockerApiVersionCache.get(key);
+
+	// Strategy 1: Use Dockhand's HTTP API to query the daemon
+	if (envId) {
+		try {
+			const { getDockerVersion } = await import('./docker.js');
+			const version = await getDockerVersion(envId) as { ApiVersion?: string };
+			const apiVersion: string | undefined = version?.ApiVersion;
+			if (apiVersion) {
+				console.log(`[Docker API Version] Detected daemon API version ${apiVersion} for env ${key} (via HTTP API)`);
+				dockerApiVersionCache.set(key, apiVersion);
+				return apiVersion;
+			}
+		} catch (err: any) {
+			console.warn(`[Docker API Version] HTTP API query failed for env ${key}: ${err?.message || err}`);
+		}
+	}
+
+	// Strategy 2: Fall back to `docker version` CLI command
+	// This handles local socket connections where envId is null and also
+	// cases where the HTTP API query fails (e.g. daemon quirks on Synology)
+	try {
+		const apiVersion = await getDockerApiVersionViaCli();
+		if (apiVersion) {
+			console.log(`[Docker API Version] Detected daemon API version ${apiVersion} for env ${key} (via CLI)`);
+			dockerApiVersionCache.set(key, apiVersion);
+			return apiVersion;
+		}
+	} catch (err: any) {
+		console.warn(`[Docker API Version] CLI query failed for env ${key}: ${err?.message || err}`);
+	}
+
+	console.warn(`[Docker API Version] Could not detect daemon API version for env ${key}`);
+	return undefined;
+}
+
+/**
+ * Get the Docker daemon's API version using the `docker version` CLI command.
+ * This is a fallback for when the HTTP API query fails or envId is null.
+ */
+function getDockerApiVersionViaCli(): Promise<string | undefined> {
+	return new Promise((resolve) => {
+		const proc = nodeSpawn('docker', ['version', '--format', '{{.Server.APIVersion}}'], {
+			stdio: ['ignore', 'pipe', 'pipe'],
+			timeout: 5000,
+			// Use the minimum Docker API version (1.25) for this probe command.
+			// This ensures the probe itself doesn't fail due to the version mismatch
+			// we're trying to detect.
+			env: {
+				PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+				DOCKER_API_VERSION: '1.25'
+			}
+		});
+		let stdout = '';
+		proc.stdout.on('data', (data: Buffer) => { stdout += data.toString(); });
+		proc.stderr?.on('data', () => {}); // drain stderr to prevent pipe buffer blocking
+		proc.on('close', (code) => {
+			const version = stdout.trim();
+			if (code === 0 && /^\d+\.\d+$/.test(version)) {
+				resolve(version);
+			} else {
+				resolve(undefined);
+			}
+		});
+		proc.on('error', () => resolve(undefined));
+	});
 }
 
 /**
@@ -178,13 +264,47 @@ async function withStackLock<T>(stackName: string, fn: () => Promise<T>): Promis
 	}
 }
 
-// Timeout configuration for compose operations
-const COMPOSE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+// Timeout configuration for compose operations (configurable via COMPOSE_TIMEOUT env var in seconds)
+const COMPOSE_TIMEOUT_MS = parseInt(process.env.COMPOSE_TIMEOUT || '900') * 1000; // Default 15 min
 const COMPOSE_KILL_GRACE_MS = 5000; // 5 seconds grace period before SIGKILL
+
+/**
+ * Check if content is binary (not valid UTF-8 text).
+ */
+const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
+function isBinaryContent(bytes: Uint8Array): boolean {
+	try {
+		utf8Decoder.decode(bytes);
+		return false;
+	} catch {
+		return true;
+	}
+}
+
+/**
+ * Collect stdout/stderr from a child process and wait for it to exit.
+ */
+function collectProcess(proc: ChildProcess): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+	return new Promise((resolve, reject) => {
+		const stdoutChunks: Buffer[] = [];
+		const stderrChunks: Buffer[] = [];
+		proc.stdout?.on('data', (chunk: Buffer) => stdoutChunks.push(chunk));
+		proc.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(chunk));
+		proc.on('error', reject);
+		proc.on('close', (code) => {
+			resolve({
+				exitCode: code ?? 1,
+				stdout: Buffer.concat(stdoutChunks).toString(),
+				stderr: Buffer.concat(stderrChunks).toString()
+			});
+		});
+	});
+}
 
 /**
  * Read all files from a directory as a map of relative path -> content.
  * Used to send files to Hawser for remote deployments.
+ * Binary files are base64-encoded with a "base64:" prefix to preserve all bytes.
  */
 async function readDirFilesAsMap(dirPath: string): Promise<Record<string, string>> {
 	const files: Record<string, string> = {};
@@ -200,9 +320,12 @@ async function readDirFilesAsMap(dirPath: string): Promise<Record<string, string
 				if (entry.name === '.git') continue;
 				await scanDir(fullPath, relPath);
 			} else if (entry.isFile()) {
-				// Read file content
-				const content = await Bun.file(fullPath).text();
-				files[relPath] = content;
+				const bytes = readFileSync(fullPath);
+				if (isBinaryContent(bytes)) {
+					files[relPath] = `base64:${bytes.toString('base64')}`;
+				} else {
+					files[relPath] = new TextDecoder().decode(bytes);
+				}
 			}
 		}
 	}
@@ -382,7 +505,7 @@ export async function getStackComposeFile(
 				};
 			}
 
-			const content = await Bun.file(source.composePath).text();
+			const content = readFileSync(source.composePath, 'utf-8');
 			const stackDir = dirname(source.composePath);
 
 			// For custom paths, suggest .env next to compose if envPath not set
@@ -420,15 +543,14 @@ export async function getStackComposeFile(
 
 		for (const fileName of composeFileNames) {
 			const actualComposePath = join(stackDir, fileName);
-			const file = Bun.file(actualComposePath);
-			if (await file.exists()) {
+			if (existsSync(actualComposePath)) {
 				// Check for .env file in the same directory
 				const envFilePath = join(stackDir, '.env');
 				const envExists = existsSync(envFilePath);
 
 				return {
 					success: true,
-					content: await file.text(),
+					content: readFileSync(actualComposePath, 'utf-8'),
 					stackDir,
 					// Always return the actual resolved paths for display
 					composePath: actualComposePath,
@@ -632,7 +754,7 @@ export async function saveStackComposeFile(
 			}
 		}
 		try {
-			await Bun.write(composePath, content);
+			writeFileSync(composePath, content);
 			return { success: true };
 		} catch (err: any) {
 			return { success: false, error: `Failed to save compose file: ${err.message}` };
@@ -672,7 +794,7 @@ export async function saveStackComposeFile(
 	}
 
 	try {
-		await Bun.write(composeFile, content);
+		writeFileSync(composeFile, content);
 		return { success: true };
 	} catch (err: any) {
 		return { success: false, error: `Failed to ${create ? 'create' : 'save'} compose file: ${err.message}` };
@@ -687,7 +809,7 @@ export async function saveStackComposeFile(
  * Login to all configured Docker registries before running compose commands.
  * This ensures that `docker compose up` can pull images from private registries.
  */
-async function loginToRegistries(dockerHost?: string, logPrefix = '[Stack]'): Promise<void> {
+async function loginToRegistries(dockerHost?: string, logPrefix = '[Stack]', apiVersion?: string): Promise<void> {
 	const { getRegistries } = await import('./db.js');
 	const registries = await getRegistries();
 
@@ -698,6 +820,10 @@ async function loginToRegistries(dockerHost?: string, logPrefix = '[Stack]'): Pr
 	const spawnEnv: Record<string, string> = { ...(process.env as Record<string, string>) };
 	if (dockerHost) {
 		spawnEnv.DOCKER_HOST = dockerHost;
+	}
+	// Cap Docker CLI API version to prevent version mismatch errors
+	if (apiVersion) {
+		spawnEnv.DOCKER_API_VERSION = apiVersion;
 	}
 
 	for (const reg of registries) {
@@ -712,26 +838,23 @@ async function loginToRegistries(dockerHost?: string, logPrefix = '[Stack]'): Pr
 
 			console.log(`${logPrefix} Logging into registry: ${registryHost}`);
 
-			const proc = Bun.spawn(
-				['docker', 'login', '-u', reg.username, '--password-stdin', registryHost],
+			const proc = nodeSpawn(
+				'docker', ['login', '-u', reg.username, '--password-stdin', registryHost],
 				{
 					env: spawnEnv,
-					stdin: 'pipe',
-					stdout: 'pipe',
-					stderr: 'pipe'
+					stdio: ['pipe', 'pipe', 'pipe']
 				}
 			);
 
-			// Write password to stdin (Bun's FileSink API)
-			proc.stdin.write(reg.password);
-			proc.stdin.end();
+			// Write password to stdin
+			proc.stdin!.write(reg.password);
+			proc.stdin!.end();
 
-			const exitCode = await proc.exited;
+			const { exitCode, stderr } = await collectProcess(proc);
 
 			if (exitCode === 0) {
 				console.log(`${logPrefix} Successfully logged into ${registryHost}`);
 			} else {
-				const stderr = await new Response(proc.stderr).text();
 				console.error(`${logPrefix} Failed to login to ${registryHost}: ${stderr}`);
 			}
 		} catch (e) {
@@ -786,7 +909,7 @@ function findComposeOverrideFile(stackDir: string, composeFileName: string): str
 }
 
 /**
- * Execute a docker compose command locally via Bun.spawn.
+ * Execute a docker compose command locally via child_process.spawn.
  *
  * @param tlsConfig - TLS configuration for remote Docker connections (certs written to temp files)
  * @param envVars - Non-secret environment variables (from .env file, passed for backward compat)
@@ -834,7 +957,7 @@ async function executeLocalCompose(
 			: (await findStackDir(stackName, envId) || await getStackDir(stackName, envId));
 		mkdirSync(stackDir, { recursive: true });
 		composeFile = join(stackDir, 'compose.yaml');
-		await Bun.write(composeFile, composeContent);
+		writeFileSync(composeFile, composeContent);
 	}
 
 	// Rewrite relative volume paths for host path translation (in memory only, not saved to disk)
@@ -874,6 +997,15 @@ async function executeLocalCompose(
 		spawnEnv.DOCKER_HOST = process.env.DOCKER_HOST;
 	}
 
+	// Auto-cap Docker CLI API version to the daemon's max supported version.
+	// This fixes compatibility with older Docker daemons (e.g. Synology DSM) that
+	// reject newer client versions. DOCKER_API_VERSION env var overrides this if set.
+	const daemonApiVersion = process.env.DOCKER_API_VERSION
+		?? await getDockerApiVersionForCli(envId);
+	if (daemonApiVersion) {
+		spawnEnv.DOCKER_API_VERSION = daemonApiVersion;
+	}
+
 	// Check if .env file exists on disk (for legacy support decision)
 	const defaultEnvPath = join(stackDir, '.env');
 	const hasEnvFile = existsSync(defaultEnvPath) || (customEnvPath && existsSync(customEnvPath));
@@ -908,15 +1040,15 @@ async function executeLocalCompose(
 		// Write certs to files (docker-compose expects specific filenames)
 		if (tlsConfig.ca) {
 			const cleanedCa = cleanPem(tlsConfig.ca);
-			if (cleanedCa) await Bun.write(join(tlsCertDir, 'ca.pem'), cleanedCa);
+			if (cleanedCa) writeFileSync(join(tlsCertDir, 'ca.pem'), cleanedCa);
 		}
 		if (tlsConfig.cert) {
 			const cleanedCert = cleanPem(tlsConfig.cert);
-			if (cleanedCert) await Bun.write(join(tlsCertDir, 'cert.pem'), cleanedCert);
+			if (cleanedCert) writeFileSync(join(tlsCertDir, 'cert.pem'), cleanedCert);
 		}
 		if (tlsConfig.key) {
 			const cleanedKey = cleanPem(tlsConfig.key);
-			if (cleanedKey) await Bun.write(join(tlsCertDir, 'key.pem'), cleanedKey);
+			if (cleanedKey) writeFileSync(join(tlsCertDir, 'key.pem'), cleanedKey);
 		}
 
 		// Set Docker TLS environment variables
@@ -941,13 +1073,13 @@ async function executeLocalCompose(
 		// Also include override file if it exists (needs path translation too)
 		const overrideFile = findComposeOverrideFile(stackDir, basename(composeFile));
 		if (overrideFile) {
-			let overrideContent = await Bun.file(overrideFile).text();
+			let overrideContent = readFileSync(overrideFile, 'utf-8');
 			if (getHostDataDir()) {
 				const rewrite = rewriteComposeVolumePaths(overrideContent, stackDir);
 				if (rewrite.modified) overrideContent = rewrite.content;
 			}
 			tempOverridePath = join(stackDir, '.compose.override.translated.yaml');
-			await Bun.write(tempOverridePath, overrideContent);
+			writeFileSync(tempOverridePath, overrideContent);
 			args.push('-f', tempOverridePath);
 			console.log(`${logPrefix} Including override file (path-translated): ${basename(overrideFile)}`);
 		}
@@ -983,7 +1115,7 @@ async function executeLocalCompose(
 		const overrideEnvPath = join(stackDir, '.env.dockhand');
 		const header = '# Auto-generated by Dockhand. Do not edit - changes will be overwritten on next deploy.\n';
 		const lines = Object.entries(envVars).map(([k, v]) => `${k}=${v}`);
-		await Bun.write(overrideEnvPath, header + lines.join('\n') + '\n');
+		writeFileSync(overrideEnvPath, header + lines.join('\n') + '\n');
 		args.push('--env-file', overrideEnvPath);
 	}
 
@@ -1001,7 +1133,7 @@ async function executeLocalCompose(
 			}
 			break;
 		case 'down':
-			args.push('down');
+			args.push('down', '--remove-orphans');
 			if (removeVolumes) args.push('--volumes');
 			break;
 		case 'stop':
@@ -1030,6 +1162,7 @@ async function executeLocalCompose(
 	console.log(`${logPrefix} Working directory:`, stackDir);
 	console.log(`${logPrefix} Compose file:`, composeFile);
 	console.log(`${logPrefix} DOCKER_HOST:`, dockerHost || '(local socket)');
+	console.log(`${logPrefix} DOCKER_API_VERSION:`, daemonApiVersion || '(not set - using CLI default)');
 	console.log(`${logPrefix} Force recreate:`, forceRecreate ?? false);
 	console.log(`${logPrefix} Remove volumes:`, removeVolumes ?? false);
 	console.log(`${logPrefix} Service name:`, serviceName ?? '(all services)');
@@ -1040,17 +1173,15 @@ async function executeLocalCompose(
 
 	// Login to registries before pulling images
 	if (operation === 'up' || operation === 'pull') {
-		await loginToRegistries(dockerHost, logPrefix);
+		await loginToRegistries(dockerHost, logPrefix, daemonApiVersion);
 	}
 
 	try {
 		console.log(`${logPrefix} Spawning docker compose process...`);
-		const proc = Bun.spawn(args, {
+		const proc = nodeSpawn(args[0], args.slice(1), {
 			cwd: stackDir,
 			env: spawnEnv,
-			stdin: useStdin ? 'pipe' : 'inherit',
-			stdout: 'pipe',
-			stderr: 'pipe'
+			stdio: [useStdin ? 'pipe' : 'inherit', 'pipe', 'pipe']
 		});
 
 		// If using stdin (host path translation), write the modified compose content
@@ -1077,12 +1208,7 @@ async function executeLocalCompose(
 		}, COMPOSE_TIMEOUT_MS);
 
 		try {
-			const [stdout, stderr] = await Promise.all([
-				new Response(proc.stdout).text(),
-				new Response(proc.stderr).text()
-			]);
-
-			const code = await proc.exited;
+			const { exitCode: code, stdout, stderr } = await collectProcess(proc);
 
 			console.log(`${logPrefix} ----------------------------------------`);
 			console.log(`${logPrefix} COMPOSE PROCESS COMPLETE`);
@@ -1343,7 +1469,7 @@ async function executeComposeCommand(
 			let hawserEnvVars = envVars;
 			if (envPath && existsSync(envPath)) {
 				try {
-					const envFileContent = await Bun.file(envPath).text();
+					const envFileContent = readFileSync(envPath, 'utf-8');
 					const envFileVars = parseEnvFileContent(envFileContent, stackName);
 					// Merge: envFileVars (lowest) < envVars (DB overrides)
 					// secretVars are handled separately in executeComposeViaHawser
@@ -1362,13 +1488,23 @@ async function executeComposeCommand(
 				const overridePath = findComposeOverrideFile(composeDir, composeBaseName);
 				if (overridePath) {
 					try {
-						const overrideContent = await Bun.file(overridePath).text();
+						const overrideContent = readFileSync(overridePath, 'utf-8');
 						hawserStackFiles = { ...(hawserStackFiles || {}), [basename(overridePath)]: overrideContent };
 						console.log(`[Stack:${stackName}] Including override file for Hawser: ${basename(overridePath)}`);
 					} catch (err) {
 						console.warn(`[Stack:${stackName}] Failed to read override file at ${overridePath}:`, err);
 					}
 				}
+			}
+
+			// For git stacks: generate .env.dockhand with non-secret DB overrides
+			// This mirrors executeLocalCompose behavior (lines 1017-1023).
+			// envVars contains only the DB overrides (not merged repo .env values from hawserEnvVars).
+			if (useOverrideFile && envVars && Object.keys(envVars).length > 0) {
+				const header = '# Auto-generated by Dockhand. Do not edit - changes will be overwritten on next deploy.\n';
+				const lines = Object.entries(envVars).map(([k, v]) => `${k}=${v}`);
+				hawserStackFiles = { ...(hawserStackFiles || {}), '.env.dockhand': header + lines.join('\n') + '\n' };
+				console.log(`[Stack:${stackName}] Including .env.dockhand override file for Hawser (${Object.keys(envVars).length} vars)`);
 			}
 
 			return executeComposeViaHawser(
@@ -1766,8 +1902,9 @@ async function requireComposeFile(
 }
 
 /**
- * Start a stack using docker compose up
- * Falls back to individual container start for stacks without compose files
+ * Start a stack using docker compose start (resumes stopped containers).
+ * Falls back to docker compose up if containers don't exist (stack was removed/down).
+ * Falls back to individual container start for stacks without compose files.
  */
 export async function startStack(
 	stackName: string,
@@ -1780,9 +1917,17 @@ export async function startStack(
 		return withContainerFallback(stackName, envId, 'start');
 	}
 
+	const opts = { stackName, envId, workingDir: result.stackDir, composePath: result.composePath, envPath: result.envPath };
+
+	// Check if containers exist for this stack. If they do, use 'start' to resume
+	// them (preserves container IDs, avoids Traefik race conditions from recreation).
+	// If no containers exist (stack was removed/down), use 'up' to create them.
+	const containers = await getStackContainers(stackName, envId);
+	const operation = containers.length > 0 ? 'start' : 'up';
+
 	return executeComposeCommand(
-		'up',
-		{ stackName, envId, workingDir: result.stackDir, composePath: result.composePath, envPath: result.envPath },
+		operation,
+		opts,
 		result.content!,
 		result.nonSecretVars,
 		result.secretVars
@@ -2185,7 +2330,7 @@ export async function deployStack(options: DeployStackOptions): Promise<StackOpe
 		}
 		if (actualEnvPath && existsSync(actualEnvPath) && !stackFiles['.env']) {
 			try {
-				const envContent = await Bun.file(actualEnvPath).text();
+				const envContent = readFileSync(actualEnvPath, 'utf-8');
 				stackFiles['.env'] = envContent;
 				console.log(`${logPrefix} Added .env to stackFiles for Hawser (${envContent.length} chars)`);
 			} catch (err) {
@@ -2415,7 +2560,7 @@ export async function writeStackEnvFile(
 		.map(v => `${v.key.trim()}=${v.value}`)
 		.join('\n') + '\n';
 
-	await Bun.write(envFilePath, rawContent);
+	writeFileSync(envFilePath, rawContent);
 }
 
 /**
@@ -2453,7 +2598,7 @@ export async function writeRawStackEnvFile(
 		mkdirSync(dir, { recursive: true });
 	}
 
-	await Bun.write(envFilePath, rawContent);
+	writeFileSync(envFilePath, rawContent);
 }
 
 /**
