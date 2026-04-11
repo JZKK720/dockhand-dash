@@ -301,7 +301,10 @@ async function sendTelegram(appriseUrl: string, payload: NotificationPayload): P
 				chat_id: chatId,
 				text: `*${escapedTitle}*${envTag}\n${escapedMessage}`,
 				...(topicId ? { message_thread_id: topicId } : {}),
-				parse_mode: 'Markdown'
+				parse_mode: 'Markdown',
+				link_preview_options: {
+					is_disabled: true
+				}
 			})
 		});
 
