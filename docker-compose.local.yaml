@@ -1,0 +1,55 @@
+# Local stack for this machine (Windows + Docker Desktop).
+#
+# dockhand runs from the official upstream image (fnsys/dockhand:latest on
+# Docker Hub) -- no local build, so a Windows checkout's CRLF line endings can
+# never corrupt the container entrypoint. Update to future releases with:
+#   docker compose -f docker-compose.local.yaml pull
+#   docker compose -f docker-compose.local.yaml up -d
+#
+# Postgres uses pgvector/pgvector:pg16 (a drop-in superset of postgres:16 that
+# also ships the `vector` extension) so the database is vector-ready.
+#
+# Host ports: 4131 (app -> container 3000), 5432 (Postgres).
+
+name: dockhand-local
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: dockhand-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dockhand
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: dockhand
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dockhand -d dockhand"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  dockhand:
+    # Pin to the upstream published image (Docker Hub). Swap `latest` for a
+    # version tag, e.g. fnsys/dockhand:v1.0.57, to pin a specific release.
+    image: fnsys/dockhand:latest
+    container_name: dockhand
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "4131:3000"
+    environment:
+      DATABASE_URL: postgres://dockhand:changeme@postgres:5432/dockhand
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - dockhand_data:/app/data
+
+volumes:
+  postgres_data:
+  dockhand_data:
