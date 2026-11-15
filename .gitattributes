@@ -1,0 +1,16 @@
+# Keep shell scripts and container entrypoints LF on every platform. On Windows,
+# core.autocrlf=true rewrites LF to CRLF on checkout, and a CRLF shell script
+# fails to exec inside a Linux container:
+#   exec /usr/local/bin/docker-entrypoint.sh: No such file or directory
+*.sh text eol=lf
+
+# Never let Git line-ending-convert binary assets.
+*.webp binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.gz binary
+*.zip binary
