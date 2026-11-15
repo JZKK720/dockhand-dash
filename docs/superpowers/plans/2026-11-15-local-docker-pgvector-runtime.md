@@ -10,6 +10,20 @@
 
 **Spec:** This plan is self-contained. It supersedes the need for a separate spec doc; every requirement below is stated as a Global Constraint or a Review Focus line.
 
+## Current State (verified 2026-11-15)
+
+**Nothing is running.** This plan stands the stack up **for the first time** — it does not modify an existing deployment.
+
+| Check | Result |
+|---|---|
+| `docker ps -a` (desktop-linux and default contexts) | Only `cloudflared` (a Cloudflare tunnel container). No container named `dockhand`. |
+| Ports 4131, 3000, 5432 | Nothing listening. All free. |
+| Dockhand process | No `node`/`bun` process running `server.js` or `build/index.js`. |
+| `fnsys/dockhand:latest` image | Present in the image list only because it was pulled during plan verification. **It has never been run.** |
+| `cloudflared` | On the default `bridge` network with no other container attached. Its ingress config is server-side (token-based tunnel), so it is not proxying a local Dockhand. |
+
+**Therefore Task 5 is not a duplicate of anything** — it creates the runtime that does not exist yet. If a Dockhand instance turns out to exist somewhere this host's Docker cannot see (another machine, a remote host, a VM), Task 5 would create a second instance and port 4131 could collide; check before running it.
+
 ## Global Constraints
 
 These apply to every task. Copy them verbatim into any file you create.
